@@ -23,19 +23,19 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 3. Event Scheduling (EventBridge / Cron): Triggers the automated ingestion pipeline to run at scheduled intervals, keeping the vector database perfectly synced with Wall Street filings.
 
 # 🛠️ Technology Stack
-Backend & API: FastAPI, Uvicorn, Pydantic
+1. Backend & API: FastAPI, Uvicorn, Pydantic
 
-Frontend: Streamlit
+2. Frontend: Streamlit
 
-Databases: Qdrant (Vector DB), PostgreSQL (Semantic Cache)
+3. Databases: Qdrant (Vector DB), PostgreSQL (Semantic Cache)
 
-AI & ML: HuggingFace sentence-transformers, Groq API, OpenAI API
+4. AI & ML: HuggingFace sentence-transformers, Groq API, OpenAI API
 
-Data Ingestion: sec-edgar-downloader, BeautifulSoup4, LangChain Text Splitters
+5. Data Ingestion: sec-edgar-downloader, BeautifulSoup4, LangChain Text Splitters
 
-Observability: MLflow, OpenTelemetry
+6. Observability: MLflow, OpenTelemetry
 
-Infrastructure: AWS EC2, AWS S3, Docker, Docker Compose
+7. Infrastructure: AWS EC2, AWS S3, Docker, Docker Compose
 
 
 # ⚙️ Setup & Deployment
