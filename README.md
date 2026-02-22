@@ -1,7 +1,3 @@
-Here is your **edited, fixed, and properly formatted README**.
-I removed duplication, fixed broken markdown, corrected code blocks, and improved structure while keeping your content intact.
-
-````markdown
 # 📈 Financial RAG System — Enterprise-Grade SEC Analyst
 
 An enterprise-grade **Retrieval-Augmented Generation (RAG)** platform that autonomously ingests, processes, and analyzes SEC financial filings (**10-K, 10-Q, 8-K, S-1**).
