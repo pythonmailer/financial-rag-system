@@ -41,54 +41,41 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 # ⚙️ Setup & Deployment
 **Clone the repository and install dependencies**
 
-**Bash**
-
-    `git clone https://github.com/pythonmailer/financial-rag-system.git`
-
-    `cd financial-rag-system`
-
-    `pip install -r requirements.txt`
+Bash
+    git clone https://github.com/pythonmailer/financial-rag-system.git
+    cd financial-rag-system
+    pip install -r requirements.txt
 
 
 **Set up environment variables**
+Create a .env file in the root directory:
 
-    Create a .env file in the root directory:
-
-        AWS Credentials
-
-            * AWS_ACCESS_KEY_ID=your_access_key
-
-            * AWS_SECRET_ACCESS_KEY=your_secret_key
-
-            * S3_BUCKET_NAME=your_sec_data_lake
-
-        LLM Routing Keys
-
-            * GROQ_API_KEY=your_groq_api_key
-
-            * OPENAI_API_KEY=your_fallback_openai_key
+    # AWS Credentials
+    AWS_ACCESS_KEY_ID=your_access_key
+    AWS_SECRET_ACCESS_KEY=your_secret_key
+    S3_BUCKET_NAME=your_sec_data_lake
+    # LLM Routing Keys
+    GROQ_API_KEY=your_groq_api_key
+    OPENAI_API_KEY=your_fallback_openai_key
 
 **Launch the Cloud Infrastructure**
 
-**Bash**
-
-    `docker-compose up -d`
+Bash
+    docker-compose up -d
 
 **Start the Application Services**
 
-**Bash**
+**Terminal 1 (Tracing)**
+Bash
+    mlflow ui --port 5001
 
-    > Terminal 1 (Tracing)
+**Terminal 2 (Backend)**
+Bash
+    uvicorn main:app --host 0.0.0.0 --port 8000
 
-        `mlflow ui --port 5001`
-
-    > Terminal 2 (Backend)
-
-        `uvicorn main:app --host 0.0.0.0 --port 8000`
-
-    > Terminal 3 (Frontend)
-
-        `streamlit run frontend.py --server.port 8501`
+**Terminal 3 (Frontend)**
+Bash
+    streamlit run frontend.py --server.port 8501
 
 # 👤 Author
 
