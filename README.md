@@ -1,7 +1,7 @@
-📈 Financial RAG System: Enterprise-Grade SEC Analyst
+# 📈 Financial RAG System: Enterprise-Grade SEC Analyst
 An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to autonomously ingest, process, and analyze SEC financial filings (10-K, 10-Q, 8-K, and S-1). Hosted on AWS, this project implements a fully decoupled architecture featuring automated batch processing, two-stage retrieval, semantic caching, and highly available LLM routing.
 
-🚀 Key Features
+# 🚀 Key Features
 1. Multi-Document SEC Pipeline: Automatically ingests and processes Annual Reports (10-K), Quarterly Reports (10-Q), Material Events (8-K), and IPO Prospectuses (S-1) for comprehensive financial analysis.
 
 2. Automated Batch Processing: Scheduled chron jobs continuously monitor the SEC EDGAR database for new filings, automatically downloading raw data to an S3 data lake and triggering asynchronous vectorization into Qdrant.
@@ -14,7 +14,7 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 
 6. Observability & Tracing: Integrated MLflow and OpenTelemetry automatically trace LLM token usage, backend latency, and execution waterfalls.
 
-☁️ Cloud Architecture (AWS)
+# ☁️ Cloud Architecture (AWS)
 
 1. Compute (Amazon EC2): Hosts the decoupled FastAPI backend, Streamlit frontend, and the open-source Qdrant vector database.
 
@@ -22,7 +22,7 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 
 3. Event Scheduling (EventBridge / Cron): Triggers the automated ingestion pipeline to run at scheduled intervals, keeping the vector database perfectly synced with Wall Street filings.
 
-🛠️ Technology Stack
+# 🛠️ Technology Stack
 Backend & API: FastAPI, Uvicorn, Pydantic
 
 Frontend: Streamlit
@@ -38,7 +38,7 @@ Observability: MLflow, OpenTelemetry
 Infrastructure: AWS EC2, AWS S3, Docker, Docker Compose
 
 
-⚙️ Setup & Deployment
+# ⚙️ Setup & Deployment
 1. Clone the repository and install dependencies
 
 Bash
@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 Create a .env file in the root directory:
 
-# AWS Credentials
+AWS Credentials
 
 AWS_ACCESS_KEY_ID=your_access_key
 
@@ -62,7 +62,7 @@ AWS_SECRET_ACCESS_KEY=your_secret_key
 
 S3_BUCKET_NAME=your_sec_data_lake
 
-# LLM Routing Keys
+LLM Routing Keys
 
 GROQ_API_KEY=your_groq_api_key
 
@@ -78,18 +78,18 @@ docker-compose up -d
 
 Bash
 
-# Terminal 1 (Tracing)
+Terminal 1 (Tracing)
 
 mlflow ui --port 5001
 
-# Terminal 2 (Backend)
+Terminal 2 (Backend)
 
 uvicorn main:app --host 0.0.0.0 --port 8000
 
-# Terminal 3 (Frontend)
+Terminal 3 (Frontend)
 
 streamlit run frontend.py --server.port 8501
 
-👤 Author
+# 👤 Author
 
 Chirag Gupta
