@@ -39,7 +39,7 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 
 
 # ⚙️ Setup & Deployment
-**Clone the repository and install dependencies**
+1. **Clone the repository and install dependencies**
 
 Bash
 
@@ -50,7 +50,7 @@ Bash
     pip install -r requirements.txt
 
 
-**Set up environment variables**
+2. **Set up environment variables**
 Create a .env file in the root directory:
 
     # AWS Credentials
@@ -62,7 +62,7 @@ Create a .env file in the root directory:
     GROQ_API_KEY=your_groq_api_key
     OPENAI_API_KEY=your_fallback_openai_key
 
-**Launch the Cloud Infrastructure**
+3. **Launch the Cloud Infrastructure**
 
 Bash
 
@@ -71,17 +71,14 @@ Bash
 **Start the Application Services**
 
 **Terminal 1 (Tracing)**
-Bash
 
     mlflow ui --port 5001
 
 **Terminal 2 (Backend)**
-Bash
 
     uvicorn main:app --host 0.0.0.0 --port 8000
 
 **Terminal 3 (Frontend)**
-Bash
 
     streamlit run frontend.py --server.port 8501
 
