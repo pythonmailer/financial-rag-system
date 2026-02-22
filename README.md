@@ -192,14 +192,3 @@ streamlit run frontend.py --server.port 8501
 # 👤 Author
 
 **Chirag Gupta**
-
-```
-
-If you want, next I can add:
-
-- GitHub badges  
-- Architecture diagram section  
-- API endpoints documentation  
-- Benchmarks (latency, cost savings, recall@k)  
-- Screenshots/GIF demo section
-```
