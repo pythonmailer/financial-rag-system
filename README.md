@@ -24,42 +24,72 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 
 🛠️ Technology Stack
 Backend & API: FastAPI, Uvicorn, Pydantic
+
 Frontend: Streamlit
+
 Databases: Qdrant (Vector DB), PostgreSQL (Semantic Cache)
+
 AI & ML: HuggingFace sentence-transformers, Groq API, OpenAI API
+
 Data Ingestion: sec-edgar-downloader, BeautifulSoup4, LangChain Text Splitters
+
 Observability: MLflow, OpenTelemetry
+
 Infrastructure: AWS EC2, AWS S3, Docker, Docker Compose
+
 
 ⚙️ Setup & Deployment
 1. Clone the repository and install dependencies
+
 Bash
+
 git clone https://github.com/pythonmailer/financial-rag-system.git
+
 cd financial-rag-system
+
 pip install -r requirements.txt
 
+
 2. Set up environment variables
+
 Create a .env file in the root directory:
+
 # AWS Credentials
+
 AWS_ACCESS_KEY_ID=your_access_key
+
 AWS_SECRET_ACCESS_KEY=your_secret_key
+
 S3_BUCKET_NAME=your_sec_data_lake
+
 # LLM Routing Keys
+
 GROQ_API_KEY=your_groq_api_key
+
 OPENAI_API_KEY=your_fallback_openai_key
 
 3. Launch the Cloud Infrastructure
+
 Bash
+
 docker-compose up -d
 
 4. Start the Application Services
+
 Bash
+
 # Terminal 1 (Tracing)
+
 mlflow ui --port 5001
+
 # Terminal 2 (Backend)
+
 uvicorn main:app --host 0.0.0.0 --port 8000
+
 # Terminal 3 (Frontend)
+
 streamlit run frontend.py --server.port 8501
 
 👤 Author
+
 Chirag Gupta
