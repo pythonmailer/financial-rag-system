@@ -1,0 +1,15 @@
+fastapi 
+uvicorn 
+sqlalchemy 
+psycopg2-binary 
+qdrant-client 
+python-dotenv
+sec-edgar-downloader 
+beautifulsoup4 
+sentence-transformers 
+langchain-text-splitters
+openai
+streamlit 
+requests
+mlflow[genai]
+opentelemetry-instrumentation-fastapi

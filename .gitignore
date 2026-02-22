@@ -1,0 +1,42 @@
+# ==========================================
+# 1. Environment Variables & Secrets
+# ==========================================
+# NEVER push your API keys to GitHub!
+.env
+.env.local
+
+# ==========================================
+# 2. Project Data & Database Caches
+# ==========================================
+# Ignore the massive HTML/Text SEC filings we downloaded
+sec_data/
+
+# Ignore local MLflow tracking logs and SQLite databases
+mlruns/
+*.db
+*.sqlite3
+
+# ==========================================
+# 3. Python & Virtual Environments
+# ==========================================
+# Ignore Conda/Python virtual environments
+venv/
+env/
+.venv/
+
+# Ignore Python compiled bytecode (makes repo messy)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================================
+# 4. OS & IDE Generated Files
+# ==========================================
+# Ignore macOS specific hidden files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Ignore IDE settings (VS Code, PyCharm)
+.vscode/
+.idea/
