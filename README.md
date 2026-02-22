@@ -41,13 +41,13 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 # ⚙️ Setup & Deployment
 **Clone the repository and install dependencies**
 
-    **Bash**
+**Bash**
 
-        `git clone https://github.com/pythonmailer/financial-rag-system.git`
+    `git clone https://github.com/pythonmailer/financial-rag-system.git`
 
-        `cd financial-rag-system`
+    `cd financial-rag-system`
 
-        `pip install -r requirements.txt`
+    `pip install -r requirements.txt`
 
 
 **Set up environment variables**
@@ -70,25 +70,25 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) system designed to auto
 
 **Launch the Cloud Infrastructure**
 
-    **Bash**
+**Bash**
 
-        `docker-compose up -d`
+    `docker-compose up -d`
 
-    **Start the Application Services**
+**Start the Application Services**
 
-    **Bash**
+**Bash**
 
-        > Terminal 1 (Tracing)
+    > Terminal 1 (Tracing)
 
-            `mlflow ui --port 5001`
+        `mlflow ui --port 5001`
 
-        > Terminal 2 (Backend)
+    > Terminal 2 (Backend)
 
-            `uvicorn main:app --host 0.0.0.0 --port 8000`
+        `uvicorn main:app --host 0.0.0.0 --port 8000`
 
-        > Terminal 3 (Frontend)
+    > Terminal 3 (Frontend)
 
-            `streamlit run frontend.py --server.port 8501`
+        `streamlit run frontend.py --server.port 8501`
 
 # 👤 Author
 
