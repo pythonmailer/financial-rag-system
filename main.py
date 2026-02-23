@@ -4,6 +4,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from fastapi import BackgroundTasks
 
 import mlflow
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -48,6 +49,11 @@ class QueryRequest(BaseModel):
     ticker: str
     top_k: int = 5
 
+@mlflow.trace(span_type="EMBEDDING")
+def embed_query(query: str):
+    """Converts the user question into a dense vector."""
+    return model.encode(query).tolist()
+
 @mlflow.trace(span_type="RETRIEVER")
 def retrieve_from_qdrant(query_vector, ticker, limit=50):
     return qdrant.query_points(
@@ -66,9 +72,22 @@ def rerank_documents(query, retrieved_texts, top_k=5):
     top_indices = np.argsort(scores)[::-1][:top_k]
     return top_indices, scores
 
+def save_to_cache(q_hash, user_q, llm_resp):
+    """Saves the generated answer to Postgres in a background thread."""
+    db_session = SessionLocal() # Open a brand new session!
+    try:
+        new_cache = CacheEntry(query_hash=q_hash, user_query=user_q, llm_response=llm_resp)
+        db_session.add(new_cache)
+        db_session.commit()
+    except Exception as e:
+        db_session.rollback()
+        print(f"Failed to save cache: {e}")
+    finally:
+        db_session.close()
+
 @app.post("/ask")
 @mlflow.trace
-async def ask_financial_question(request: QueryRequest):
+async def ask_financial_question(request: QueryRequest, background_tasks: BackgroundTasks):
     db = SessionLocal()
     try:
         # --- 1. THE CACHE CHECK ---
@@ -85,7 +104,7 @@ async def ask_financial_question(request: QueryRequest):
             }
 
         # --- 2. THE RAG PIPELINE ---
-        query_vector = model.encode(request.query).tolist()
+        query_vector = embed_query(request.query)
         search_response = retrieve_from_qdrant(query_vector, request.ticker)
         retrieved_texts = [hit.payload["text"] for hit in search_response.points]
         top_indices, rerank_scores = rerank_documents(request.query, retrieved_texts, request.top_k)
@@ -128,9 +147,7 @@ async def ask_financial_question(request: QueryRequest):
                 raise e # Fail gracefully if Groq goes down and no fallback exists
 
         # --- 4. CACHE & RETURN ---
-        new_cache = CacheEntry(query_hash=query_hash, user_query=request.query, llm_response=final_answer)
-        db.add(new_cache)
-        db.commit()
+        background_tasks.add_task(save_to_cache, query_hash, request.query, final_answer)
 
         return {
             "query": request.query, 
@@ -143,5 +160,6 @@ async def ask_financial_question(request: QueryRequest):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         db.close()
