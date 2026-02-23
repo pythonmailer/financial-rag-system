@@ -49,8 +49,18 @@ if prompt := st.chat_input("E.g., What are the major supply chain risks?"):
                     answer = data["answer"]
                     sources = data["sources"]
                     
+                    # Extract our new advanced metadata
+                    is_cached = data.get("cached", False)
+                    provider = data.get("provider", "Groq")
+                    
                     # Display the AI's answer
                     message_placeholder.markdown(answer)
+                    
+                    # --- NEW: Display the Engine Metadata ---
+                    if is_cached:
+                        st.caption("⚡ **Blazing Fast:** Retrieved directly from Postgres Semantic Cache")
+                    else:
+                        st.caption(f"🤖 **Engine:** Generated dynamically using {provider}")
                     
                     # Display the exact SEC sources in an expandable box
                     with st.expander("📚 View SEC Sources"):
@@ -61,9 +71,6 @@ if prompt := st.chat_input("E.g., What are the major supply chain risks?"):
                             
                     # Add AI response to chat history
                     st.session_state.messages.append({"role": "assistant", "content": answer})
-                    
-                else:
-                    st.error(f"Backend Error: {response.text}")
                     
             except Exception as e:
                 st.error(f"Failed to connect to the backend. Is FastAPI running? Error: {e}")

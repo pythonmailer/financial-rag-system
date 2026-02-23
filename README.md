@@ -48,8 +48,8 @@ Significantly improves factual grounding and reduces hallucinations.
 
 ---
 
-## 🔁 High-Availability LLM Routing
-Intelligent API router with automatic failover:
+## 🔁 High-Availability LLM Fallback
+Intelligent mechanism with automatic failover:
 
 - Primary: **Llama-3 via Groq**  
 - Fallback: **OpenAI API**  
