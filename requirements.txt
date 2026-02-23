@@ -13,3 +13,4 @@ streamlit
 requests
 mlflow[genai]
 opentelemetry-instrumentation-fastapi
+langchain-text-splitters
