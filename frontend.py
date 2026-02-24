@@ -7,7 +7,7 @@ st.title("📈 Wall Street AI Analyst")
 st.caption("Ask questions about Apple's (AAPL) latest SEC filings.")
 
 # Define the FastAPI backend URL
-API_URL = "http://localhost:8001/ask"
+API_URL = "http://backend:8001/ask"
 
 # Initialize chat history in Streamlit's session state
 if "messages" not in st.session_state:
