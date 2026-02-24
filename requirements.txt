@@ -15,3 +15,4 @@ requests
 mlflow[genai]
 opentelemetry-instrumentation-fastapi
 boto3
+httpx
