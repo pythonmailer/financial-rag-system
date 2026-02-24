@@ -7,7 +7,6 @@ python-dotenv
 sec-edgar-downloader
 beautifulsoup4
 sentence-transformers
-cross-encoder
 langchain-text-splitters
 openai
 streamlit
@@ -16,3 +15,4 @@ mlflow[genai]
 opentelemetry-instrumentation-fastapi
 boto3
 httpx
+schedule

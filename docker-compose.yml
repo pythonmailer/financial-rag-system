@@ -10,17 +10,53 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: rag_qdrant
+    container_name: qdrant
     ports:
-      - "6333:6333" 
-      - "6334:6334" 
+      - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: mlflow
+    ports:
+      - "5001:5001"
+    command: mlflow ui --host 0.0.0.0 --port 5001
+
+  backend:
+    build: .
+    container_name: rag_backend
+    command: uvicorn main2:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      - postgres
+      - qdrant
+      - mlflow
+
+  frontend:
+    build: .
+    container_name: rag_frontend
+    command: streamlit run frontend.py --server.port 8501
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
+  scheduler:
+    build: .
+    container_name: rag_scheduler
+    command: python scheduler.py
+    volumes:
+      - ./sec_data:/app/sec_data
+    depends_on:
+      - qdrant
 
 volumes:
   postgres_data:

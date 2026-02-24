@@ -29,9 +29,10 @@ async def startup_event():
     asyncio.create_task(batch_processor())
 
 # ==========================================
-# 2. INFRASTRUCTURE & MODELS
+# 2. INFRASTRUCTURE & MODELS (DOCKER UPDATED)
 # ==========================================
-mlflow.set_tracking_uri("http://localhost:5001") 
+# Use service names 'mlflow' and 'qdrant' instead of localhost
+mlflow.set_tracking_uri("http://mlflow:5001") 
 mlflow.set_experiment("Financial-RAG")
 mlflow.openai.autolog()
 FastAPIInstrumentor.instrument_app(app)
@@ -39,7 +40,7 @@ FastAPIInstrumentor.instrument_app(app)
 print("Loading AI Models (Embedder & Reranker)...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-qdrant = QdrantClient(url="http://localhost:6333")
+qdrant = QdrantClient(url="http://qdrant:6333") # Use service name 'qdrant'
 
 primary_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -63,90 +64,12 @@ class QueryRequest(BaseModel):
     ticker: str
     top_k: int = 5
 
-# ==========================================
-# 3. CORE RAG & ROUTING FUNCTIONS
-# ==========================================
-@mlflow.trace(span_type="BATCH_EMBEDDING")
-def embed_query_batch(queries: list[str]):
-    return model.encode(queries).tolist()
-
-def retrieve_from_qdrant(query_vector, ticker, limit=15):
-    return qdrant.query_points(
-        collection_name="financial_documents",
-        query=query_vector,
-        limit=limit,
-        query_filter=models.Filter(
-            must=[models.FieldCondition(key="ticker", match=models.MatchValue(value=ticker.upper()))]
-        )
-    )
-
-def rerank_documents(query, retrieved_texts, top_k=5):
-    sentence_combinations = [[query, text] for text in retrieved_texts]
-    scores = reranker.predict(sentence_combinations)
-    top_indices = np.argsort(scores)[::-1][:top_k]
-    return top_indices, scores
-
-def save_to_cache(q_hash, user_query, llm_response):
-    db_session = SessionLocal() 
-    try:
-        new_cache = CacheEntry(query_hash=q_hash, user_query=user_query, llm_response=llm_response)
-        db_session.add(new_cache)
-        db_session.commit()
-    except Exception as e:
-        db_session.rollback()
-        print(f"Failed to save cache: {e}")
-    finally:
-        db_session.close()
-
-@mlflow.trace(span_type="ROUTER")
-async def route_query(query: str) -> str:
-    system_prompt = """You are a classification router for a financial system.
-    Evaluate the user's question. 
-    If it requires basic extraction (finding a specific number, name, or single fact), output exactly 'SIMPLE'.
-    If it requires cross-referencing topics, deep synthesis, comparing risks, or advanced reasoning, output exactly 'COMPLEX'.
-    Do not explain your reasoning. Output NOTHING ELSE besides SIMPLE or COMPLEX."""
-    try:
-        response = await primary_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query}
-            ],
-            temperature=0.0,
-            max_tokens=5
-        )
-        classification = response.choices[0].message.content.strip().upper()
-        return "COMPLEX" if "COMPLEX" in classification else "SIMPLE"
-    except Exception as e:
-        print(f"⚠️ Router failed, defaulting to SIMPLE: {e}")
-        return "SIMPLE"
+# ... [Keep embed_query_batch, retrieve_from_qdrant, rerank_documents, save_to_cache] ...
 
 # ==========================================
 # 4. GENERATION & BATCH ENGINE
 # ==========================================
-async def generate_with_fallback(system_prompt, user_query, target_model):
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
-    try:
-        completion = await primary_client.chat.completions.create(
-            model=target_model, messages=messages, temperature=0.2 
-        )
-        return completion.choices[0].message.content, f"Groq ({target_model})"
-    except Exception:
-        if gemini_client:
-            try:
-                completion = await gemini_client.chat.completions.create(
-                    model="gemini-1.5-flash", messages=messages, temperature=0.2 
-                )
-                return completion.choices[0].message.content, "Gemini"
-            except Exception:
-                if openrouter_client:
-                    try:
-                        completion = await openrouter_client.chat.completions.create(
-                            model="meta-llama/llama-3-8b-instruct:free", messages=messages, temperature=0.2 
-                        )
-                        return completion.choices[0].message.content, "OpenRouter"
-                    except Exception: pass
-        return "⚠️ Service Notice: High traffic. Please review the sources below.", "System Degraded"
+# [Your logic remains correct here, just ensure route_query and generate_with_fallback are async]
 
 async def batch_processor():
     while True:
@@ -167,10 +90,8 @@ async def batch_processor():
             mlflow.set_tag("batch_size", len(batch))
 
         async def process_independently(i, fut, req, bg_tasks):
-            # Create a top-level span and MANUALLY set the input query
             with mlflow.start_span(name=f"Request_{i+1}_{req.ticker}", span_type="USER_QUERY") as user_span:
                 try:
-                    # Log the input query so it's not null in MLflow
                     user_span.set_inputs({"query": req.query, "ticker": req.ticker})
                     mlflow.set_tag("ticker", req.ticker)
                     
@@ -181,8 +102,6 @@ async def batch_processor():
 
                         combined_text = "".join([f"- {retrieved_texts[idx]}\n\n" for idx in top_indices])
                         retrieved_chunks = [{"score": float(rerank_scores[idx]), "text": retrieved_texts[idx]} for idx in top_indices]
-                        
-                        # Log what chunks were found
                         rag_span.set_outputs({"num_chunks": len(retrieved_chunks)})
 
                     with mlflow.start_span(name="Semantic_Router", span_type="CLASSIFICATION") as route_span:
@@ -197,12 +116,11 @@ async def batch_processor():
                             req.query,
                             target_model
                         )
-                        # Log the final answer so it shows up in MLflow
                         gen_span.set_outputs({"answer": final_answer, "provider": provider})
 
-                    # Set the final output for the entire User Trace
                     user_span.set_outputs({"final_answer": final_answer})
 
+                    # Finalize & Return
                     q_hash = hashlib.sha256(f"{req.ticker.upper()}_{req.query.strip().lower()}".encode()).hexdigest()
                     bg_tasks.add_task(save_to_cache, q_hash, req.query, final_answer)
                     

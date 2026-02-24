@@ -174,7 +174,7 @@ mlflow ui --port 5001
 ### Terminal 2 — Backend
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+uvicorn main2:app --host 0.0.0.0 --port 8001
 ```
 
 ### Terminal 3 — Frontend
