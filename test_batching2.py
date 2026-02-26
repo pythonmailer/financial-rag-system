@@ -20,7 +20,7 @@ QUERIES = [
 async def fetch_answer(client, query_text, index, global_start_time):
     payload = {
         "query": query_text,
-        "ticker": "JHDO", 
+        "ticker": "HJD", 
         "top_k": 5
     }
     

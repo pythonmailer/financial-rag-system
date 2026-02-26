@@ -1,4 +1,7 @@
 import os
+import time
+import json
+import tempfile
 import hashlib
 import numpy as np
 import asyncio
@@ -23,10 +26,7 @@ app = FastAPI(title="Financial RAG API - Stream-Batched")
 # 1. DYNAMIC BATCHING SETUP
 # ==========================================
 request_queue = asyncio.Queue()
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(batch_processor())
+MAX_BATCH_SIZE = 32  # Prevents OOM and latency spikes during massive bursts
 
 # ==========================================
 # 2. INFRASTRUCTURE & MODELS
@@ -41,6 +41,52 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 qdrant = QdrantClient(url="http://qdrant:6333")
 
+# ==========================================
+# CIRCUIT BREAKER STATE (Atomic & Multi-Worker Safe)
+# ==========================================
+class CircuitBreaker:
+    def __init__(self, service_name="groq"):
+        self.file_path = os.path.join(tempfile.gettempdir(), f"{service_name}_cb_state.json")
+
+    def _write_state(self, state: dict):
+        """Atomic write to prevent JSONDecodeError across multiple workers."""
+        tmp_path = self.file_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp_path, self.file_path)  # Atomic on POSIX
+        except Exception:
+            pass
+
+    @property
+    def is_healthy(self):
+        if not os.path.exists(self.file_path):
+            return True
+        try:
+            with open(self.file_path, "r") as f:
+                state = json.load(f)
+            if not state.get("healthy", True):
+                if time.time() > state.get("disabled_until", 0):
+                    self.set_healthy(True)
+                    return True
+                return False
+            return True
+        except Exception:
+            return True  # Fail open if locked/corrupt
+
+    def trip(self, cooldown_seconds=60):
+        state = {"healthy": False, "disabled_until": time.time() + cooldown_seconds}
+        self._write_state(state)
+
+    def set_healthy(self, healthy=True):
+        state = {"healthy": healthy, "disabled_until": 0}
+        self._write_state(state)
+
+groq_breaker = CircuitBreaker("groq")
+
+# ==========================================
+# API CLIENTS
+# ==========================================
 primary_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=os.getenv("GROQ_API_KEY")
@@ -58,16 +104,20 @@ openrouter_client = AsyncOpenAI(
     api_key=openrouter_key
 ) if openrouter_key else None
 
+
 class QueryRequest(BaseModel):
     query: str
     ticker: str
     top_k: int = 5
 
+
 # ==========================================
-# 3. CORE RAG FUNCTIONS
+# CORE RAG FUNCTIONS
 # ==========================================
+@mlflow.trace(span_type="BATCH_EMBEDDING")
 def embed_query_batch(queries: list[str]):
     return model.encode(queries).tolist()
+
 
 def retrieve_from_qdrant(query_vector, ticker, limit=15):
     return qdrant.query_points(
@@ -79,11 +129,17 @@ def retrieve_from_qdrant(query_vector, ticker, limit=15):
         )
     )
 
+
 def rerank_documents(query, retrieved_texts, top_k=5):
+    if top_k <= 0 or not retrieved_texts:
+        return [], np.array([])
+        
+    top_k = min(top_k, len(retrieved_texts))
     sentence_combinations = [[query, text] for text in retrieved_texts]
     scores = reranker.predict(sentence_combinations)
     top_indices = np.argsort(scores)[::-1][:top_k]
     return top_indices, scores
+
 
 def save_to_cache(q_hash, user_query, llm_response):
     db_session = SessionLocal()
@@ -97,57 +153,123 @@ def save_to_cache(q_hash, user_query, llm_response):
     finally:
         db_session.close()
 
-@mlflow.trace(span_type="ROUTER")
-async def route_query(query: str) -> str:
-    system_prompt = """You are a classification router for a financial system.
-If it requires basic extraction output SIMPLE.
-If it requires synthesis output COMPLEX.
-Output ONLY SIMPLE or COMPLEX."""
-    try:
-        response = await primary_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query}
-            ],
-            temperature=0.0,
-            max_tokens=5
-        )
-        classification = response.choices[0].message.content.strip().upper()
-        return "COMPLEX" if "COMPLEX" in classification else "SIMPLE"
-    except Exception as e:
-        print(f"⚠️ Router failed, defaulting to SIMPLE: {e}")
-        return "SIMPLE"
-
-async def generate_with_fallback(system_prompt, user_query, target_model):
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
-    try:
-        completion = await primary_client.chat.completions.create(
-            model=target_model, messages=messages, temperature=0.2
-        )
-        return completion.choices[0].message.content, f"Groq ({target_model})"
-    except Exception:
-        if gemini_client:
-            try:
-                completion = await gemini_client.chat.completions.create(
-                    model="gemini-1.5-flash", messages=messages, temperature=0.2
-                )
-                return completion.choices[0].message.content, "Gemini"
-            except Exception:
-                if openrouter_client:
-                    try:
-                        completion = await openrouter_client.chat.completions.create(
-                            model="meta-llama/llama-3-8b-instruct:free",
-                            messages=messages,
-                            temperature=0.2
-                        )
-                        return completion.choices[0].message.content, "OpenRouter"
-                    except Exception:
-                        pass
-        return "⚠️ Service Notice: High traffic. Please review the sources below.", "System Degraded"
 
 # ==========================================
-# 4. BATCH ENGINE
+# ROUTER
+# ==========================================
+@mlflow.trace(span_type="ROUTER")
+async def route_query(query: str) -> tuple[str, str]:
+    """Returns (complexity, successful_provider) to prevent double-latency on timeouts."""
+    system_prompt = "You are a financial router. Output exactly SIMPLE or COMPLEX."
+
+    async def try_route(client, model_name):
+        return await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.0,
+                max_tokens=5,
+            ),
+            timeout=4,
+        )
+
+    if groq_breaker.is_healthy:
+        try:
+            resp = await try_route(primary_client, "llama-3.1-8b-instant")
+            classification = resp.choices[0].message.content.strip().upper()
+            return ("COMPLEX" if "COMPLEX" in classification else "SIMPLE", "Groq")
+        except asyncio.TimeoutError:
+            print("⚠️ Router Groq timeout (Not tripping breaker)")
+        except Exception as e:
+            print(f"⚠️ Router Groq failed: {e}")
+            if "401" in str(e) or "authentication" in str(e).lower():
+                groq_breaker.trip(60)
+
+    if gemini_client:
+        try:
+            # FIX: Upgraded to Gemini 2.5 models
+            resp = await try_route(gemini_client, "gemini-2.5-flash")
+            classification = resp.choices[0].message.content.strip().upper()
+            return ("COMPLEX" if "COMPLEX" in classification else "SIMPLE", "Gemini")
+        except Exception as e:
+            print(f"⚠️ Router Gemini failed: {e}")
+
+    return ("SIMPLE", "System Degraded")
+
+
+# ==========================================
+# GENERATION ENGINE
+# ==========================================
+async def generate_with_fallback(system_prompt, user_query, complexity: str, router_provider: str):
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_query},
+    ]
+
+    groq_model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
+    
+    # FIX: Upgraded to Gemini 2.5 models
+    gemini_model = "gemini-2.5-pro" if complexity == "COMPLEX" else "gemini-2.5-flash"
+    
+    openrouter_model = (
+        "meta-llama/llama-3.1-70b-instruct"
+        if complexity == "COMPLEX"
+        else "meta-llama/llama-3.1-8b-instruct"
+    )
+
+    # Only try Groq if the circuit breaker is healthy AND the router didn't time out on it
+    if groq_breaker.is_healthy and router_provider == "Groq":
+        try:
+            completion = await asyncio.wait_for(
+                primary_client.chat.completions.create(
+                    model=groq_model, messages=messages, temperature=0.2
+                ),
+                timeout=8,
+            )
+            return completion.choices[0].message.content, f"Groq ({groq_model})"
+        except asyncio.TimeoutError:
+            print("⚠️ Groq timeout during generation")
+        except Exception as e:
+            print(f"⚠️ Groq Failed: {e}")
+            if "401" in str(e) or "authentication" in str(e).lower():
+                groq_breaker.trip(60)
+
+    if gemini_client:
+        try:
+            print(f"🔄 Attempting Gemini Fallback... ({gemini_model})")
+            completion = await asyncio.wait_for(
+                gemini_client.chat.completions.create(
+                    model=gemini_model, messages=messages, temperature=0.2
+                ),
+                timeout=8,
+            )
+            return completion.choices[0].message.content, f"Gemini ({gemini_model})"
+        except asyncio.TimeoutError:
+            print("⚠️ Gemini timeout during generation")
+        except Exception as e:
+            print(f"⚠️ Gemini Failed: {e}")
+
+    if openrouter_client:
+        try:
+            print("🔄 Attempting OpenRouter Fallback...")
+            completion = await asyncio.wait_for(
+                openrouter_client.chat.completions.create(
+                    model=openrouter_model, messages=messages, temperature=0.2
+                ),
+                timeout=8,
+            )
+            return completion.choices[0].message.content, f"OpenRouter ({openrouter_model})"
+        except Exception as e:
+            print(f"⚠️ OpenRouter Failed: {e}")
+
+    return "⚠️ Service Notice: All providers unavailable. Review sources below.", "System Degraded"
+
+
+# ==========================================
+# BATCH ENGINE
 # ==========================================
 async def batch_processor():
     while True:
@@ -155,90 +277,103 @@ async def batch_processor():
         fut, req, bg_tasks = await request_queue.get()
         batch.append((fut, req, bg_tasks))
 
-        await asyncio.sleep(0.5)
+        sleep_time = 0.05 if request_queue.qsize() > 0 else 0.5
+        await asyncio.sleep(sleep_time)
 
-        while not request_queue.empty():
+        # Cap the batch size to prevent overwhelming memory or latency
+        while not request_queue.empty() and len(batch) < MAX_BATCH_SIZE:
             batch.append(request_queue.get_nowait())
 
         print(f"\n📦 [BATCH WINDOW CLOSED] Processing {len(batch)} requests...")
         queries = [item[1].query for item in batch]
 
-        # ---- Shared batch embedding (no MLflow span) ----
-        batch_start = asyncio.get_event_loop().time()
-        batch_vectors = await asyncio.to_thread(embed_query_batch, queries)
-        batch_latency = asyncio.get_event_loop().time() - batch_start
-        batch_size = len(batch)
+        loop = asyncio.get_running_loop()
+
+        with mlflow.start_span(name="Global_Batch_Embedding", span_type="SHARED_COMPUTE") as batch_span:
+            batch_start = loop.time()
+            batch_vectors = await asyncio.to_thread(embed_query_batch, queries)
+            batch_latency = loop.time() - batch_start
+            batch_size = len(batch)
+            batch_span.set_inputs({"num_queries": batch_size})
+            batch_span.set_attribute("latency_ms", round(batch_latency * 1000, 2))
 
         async def process_independently(i, fut, req, bg_tasks):
             with mlflow.start_span(name=f"Request_{i+1}_{req.ticker}", span_type="USER_QUERY") as user_span:
                 try:
                     user_span.set_inputs({"query": req.query, "ticker": req.ticker})
+                    user_span.set_attribute("batch_size", batch_size)
+                    user_span.set_attribute("cache_hit", False)
 
-                    # Attach batch observability
-                    user_span.set_tag("batch_size", batch_size)
-                    user_span.set_tag("shared_embedding_latency_ms", round(batch_latency * 1000, 2))
-                    user_span.set_metric("batch_size", batch_size)
-                    user_span.set_metric("shared_embedding_latency_ms", batch_latency * 1000)
-
-                    # ---- Retrieval + Rerank ----
+                    # Retrieval
                     with mlflow.start_span(name="Retrieval_and_Rerank", span_type="RAG_PIPELINE") as rag_span:
                         search_response = await asyncio.to_thread(
                             retrieve_from_qdrant, batch_vectors[i], req.ticker
                         )
-                        retrieved_texts = [hit.payload["text"] for hit in search_response.points]
 
-                        top_indices, rerank_scores = await asyncio.to_thread(
-                            rerank_documents, req.query, retrieved_texts, req.top_k
-                        )
-
-                        combined_text = "".join(
-                            [f"- {retrieved_texts[idx]}\n\n" for idx in top_indices]
-                        )
-
-                        retrieved_chunks = [
-                            {"score": float(rerank_scores[idx]), "text": retrieved_texts[idx]}
-                            for idx in top_indices
+                        retrieved_texts = [
+                            hit.payload.get("text", "")
+                            for hit in search_response.points
+                            if hit.payload
                         ]
+                        retrieved_texts = [t for t in retrieved_texts if t]
+
+                        if not retrieved_texts:
+                            combined_text = (
+                                "No relevant financial data found in context.\n\n"
+                                "If context is empty, say you do not have enough data."
+                            )
+                            retrieved_chunks = []
+                        else:
+                            top_indices, rerank_scores = await asyncio.to_thread(
+                                rerank_documents, req.query, retrieved_texts, req.top_k
+                            )
+                            combined_text = "".join(
+                                [f"- {retrieved_texts[idx]}\n\n" for idx in top_indices]
+                            )
+                            retrieved_chunks = [
+                                {"score": float(rerank_scores[idx]), "text": retrieved_texts[idx]}
+                                for idx in top_indices
+                            ]
 
                         rag_span.set_outputs({"num_chunks": len(retrieved_chunks)})
 
-                    # ---- Router ----
+                    # Routing
                     with mlflow.start_span(name="Semantic_Router", span_type="CLASSIFICATION") as route_span:
-                        route_decision = await route_query(req.query)
-                        target_model = (
-                            "llama-3.3-70b-versatile"
-                            if route_decision == "COMPLEX"
-                            else "llama-3.1-8b-instant"
-                        )
-                        route_span.set_outputs({"decision": route_decision})
+                        complexity, router_provider = await route_query(req.query)
+                        route_span.set_outputs({"decision": complexity, "routed_via": router_provider})
 
-                    # ---- LLM Generation ----
+                    # Generation
                     with mlflow.start_span(name="LLM_Generation", span_type="INFERENCE") as gen_span:
                         final_answer, provider = await generate_with_fallback(
                             f"You are a Wall Street analyst. Use ONLY the context:\n\n{combined_text}",
                             req.query,
-                            target_model
+                            complexity,
+                            router_provider
                         )
-                        gen_span.set_outputs({"answer": final_answer, "provider": provider})
+                        gen_span.set_outputs({"answer": final_answer})
+                        gen_span.set_attribute("provider", provider)
+                        gen_span.set_attribute("complexity", complexity)
 
                     user_span.set_outputs({"final_answer": final_answer})
 
-                    # ---- Cache write ----
-                    q_hash = hashlib.sha256(
-                        f"{req.ticker.upper()}_{req.query.strip().lower()}".encode()
-                    ).hexdigest()
+                    if provider != "System Degraded":
+                        q_hash = hashlib.sha256(
+                            f"{req.ticker.upper()}_{req.query.strip().lower()}".encode()
+                        ).hexdigest()
+                        bg_tasks.add_task(save_to_cache, q_hash, req.query, final_answer)
 
-                    bg_tasks.add_task(save_to_cache, q_hash, req.query, final_answer)
-
-                    fut.set_result({
-                        "query": req.query,
-                        "answer": final_answer,
-                        "sources": retrieved_chunks,
-                        "cached": False,
-                        "provider": provider
-                    })
+                    fut.set_result(
+                        {
+                            "query": req.query,
+                            "answer": final_answer,
+                            "sources": retrieved_chunks,
+                            "cached": False,
+                            "provider": provider,
+                        }
+                    )
 
                 except Exception as e:
+                    print(f"❌ Critical Error in Independent Task: {e}")
                     user_span.set_outputs({"error": str(e)})
                     fut.set_exception(e)
 
@@ -246,12 +381,23 @@ async def batch_processor():
             process_independently(i, fut, req, bg_tasks)
             for i, (fut, req, bg_tasks) in enumerate(batch)
         ]
-
         await asyncio.gather(*tasks)
 
+
 # ==========================================
-# 5. API ENDPOINT
+# API ENDPOINTS
 # ==========================================
+@app.on_event("startup")
+async def startup_event():
+    # DEBUG: Check if Gemini Key is loaded
+    if not os.getenv("GEMINI_API_KEY"):
+        print("\n🚨 WARNING: GEMINI_API_KEY is missing from environment! Gemini fallback will NOT work.\n")
+    else:
+        print("\n✅ GEMINI_API_KEY loaded successfully.\n")
+
+    asyncio.create_task(batch_processor())
+
+
 @app.post("/ask")
 async def ask_financial_question(request: QueryRequest, background_tasks: BackgroundTasks):
     db = SessionLocal()
@@ -260,17 +406,20 @@ async def ask_financial_question(request: QueryRequest, background_tasks: Backgr
             f"{request.ticker.upper()}_{request.query.strip().lower()}".encode()
         ).hexdigest()
 
-        cached_result = db.query(CacheEntry).filter(
-            CacheEntry.query_hash == query_hash
-        ).first()
+        cached_result = db.query(CacheEntry).filter(CacheEntry.query_hash == query_hash).first()
 
         if cached_result:
+            with mlflow.start_span(name="Cache_Hit", span_type="CACHE") as cache_span:
+                cache_span.set_inputs({"query": request.query, "ticker": request.ticker})
+                cache_span.set_outputs({"provider": "Cache"})
+                cache_span.set_attribute("cache_hit", True)
+
             return {
                 "query": request.query,
                 "answer": cached_result.llm_response,
-                "sources": [{"score": 1.0, "text": "Retrieved from Postgres Semantic Cache"}],
+                "sources": [{"score": 1.0, "text": "Semantic Cache"}],
                 "cached": True,
-                "provider": "Cache"
+                "provider": "Cache",
             }
 
         loop = asyncio.get_running_loop()
