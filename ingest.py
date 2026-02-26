@@ -13,7 +13,7 @@ def run_ingestion(ticker="AAPL", filing_types=["10-K"]):
     
     # 1. Initialize Connection (Uses Docker service name 'qdrant')
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    qdrant = QdrantClient(url="http://qdrant:6333") 
+    qdrant = QdrantClient(url="http://localhost:6333") 
 
     # 2. Download latest filings
     # Downloader skips files if they already exist locally
