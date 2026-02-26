@@ -1,5 +1,6 @@
 import os
 import uuid
+import requests
 from bs4 import BeautifulSoup
 from sec_edgar_downloader import Downloader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -52,6 +53,16 @@ def run_ingestion(ticker="AAPL", filing_types=["10-K"]):
                     # 5. Push to Vector DB
                     qdrant.upsert(collection_name="financial_documents", points=points)
                     print(f"✅ Successfully ingested {len(chunks)} chunks for {ticker} {f_type}")
+                    
+    # 6. NEW: Clear the API Cache so the next user gets the fresh data
+    print(f"🧹 Wiping stale semantic cache for {ticker}...")
+    try:
+        # Pass the ticker into the URL
+        response = requests.delete(f"http://localhost:8001/cache/clear/{ticker}") 
+        if response.status_code == 200:
+            print(f"✨ Cache cleared! Deleted {response.json()['cleared_entries']} old entries for {ticker}.")
+    except Exception as e:
+        print(f"⚠️ Could not reach API to clear cache. Error: {e}")
 
 if __name__ == "__main__":
     run_ingestion()

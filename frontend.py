@@ -65,8 +65,12 @@ if prompt := st.chat_input("E.g., What are the major supply chain risks?"):
                     # Display the exact SEC sources in an expandable box
                     with st.expander("📚 View SEC Sources"):
                         for i, source in enumerate(sources):
-                            st.markdown(f"**Source {i+1} (Relevance: {source['score']:.2f}):**")
-                            st.caption(source['text'])
+                            # Grab the document_type (default to "Unknown" if it's from the cache fallback)
+                            doc_type = source.get("document_type", "Unknown")
+                            
+                            # Add the document type to the bold header
+                            st.markdown(f"**Source {i+1} ({doc_type}) | Relevance: {source.get('score', 1.0):.2f}:**")
+                            st.caption(source.get('text', ''))
                             st.divider()
                             
                     # Add AI response to chat history

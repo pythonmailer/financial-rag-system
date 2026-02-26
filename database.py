@@ -19,6 +19,7 @@ class CacheEntry(Base):
     user_query = Column(Text)
     llm_response = Column(Text)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ticker = Column(String, index=True)
 
 try:
     Base.metadata.create_all(bind=engine)
