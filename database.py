@@ -1,4 +1,5 @@
 import os
+import time
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from qdrant_client import QdrantClient
@@ -12,6 +13,14 @@ engine = create_engine(POSTGRES_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+class FeedbackEntry(Base):
+    __tablename__ = "user_feedback"
+    id = Column(Integer, primary_key=True, index=True)
+    query_hash = Column(String, index=True)
+    rating = Column(Integer)  # 1 for Thumbs Up, -1 for Thumbs Down
+    # Updated to avoid Python 3.12+ deprecation warnings
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 class CacheEntry(Base):
     __tablename__ = "semantic_cache"
     id = Column(Integer, primary_key=True, index=True)
@@ -21,19 +30,44 @@ class CacheEntry(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     ticker = Column(String, index=True)
 
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    print(f"❌ PostgreSQL Connection Error: {e}")
+# ==========================================
+# ROBUST DATABASE INITIALIZATION (Retry Loop)
+# ==========================================
+MAX_RETRIES = 5
+RETRY_DELAY = 3
 
-try:
-    # Updated to use service name 'qdrant'
-    qdrant = QdrantClient(url="http://qdrant:6333")
-    collection_name = "financial_documents"
-    if not qdrant.collection_exists(collection_name):
-        qdrant.create_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-        )
-except Exception as e:
-    print(f"❌ Qdrant Connection Error: {e}")
+for attempt in range(MAX_RETRIES):
+    try:
+        # This forces a connection attempt
+        Base.metadata.create_all(bind=engine)
+        print("✅ Successfully connected to PostgreSQL and verified tables.")
+        break
+    except Exception as e:
+        print(f"⏳ Waiting for PostgreSQL to be ready... (Attempt {attempt + 1}/{MAX_RETRIES})")
+        time.sleep(RETRY_DELAY)
+else:
+    print("❌ CRITICAL: Could not connect to PostgreSQL after multiple attempts.")
+
+# ==========================================
+# QDRANT INITIALIZATION
+# ==========================================
+for attempt in range(MAX_RETRIES):
+    try:
+        # Updated to use service name 'qdrant'
+        qdrant = QdrantClient(url="http://qdrant:6333")
+        collection_name = "financial_documents"
+        
+        if not qdrant.collection_exists(collection_name):
+            qdrant.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+            )
+            print(f"✅ Qdrant collection '{collection_name}' created successfully.")
+        else:
+            print(f"✅ Connected to Qdrant. Collection '{collection_name}' already exists.")
+        break
+    except Exception as e:
+        print(f"⏳ Waiting for Qdrant to be ready... (Attempt {attempt + 1}/{MAX_RETRIES})")
+        time.sleep(RETRY_DELAY)
+else:
+    print("❌ CRITICAL: Could not connect to Qdrant after multiple attempts.")

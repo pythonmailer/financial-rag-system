@@ -16,3 +16,4 @@ opentelemetry-instrumentation-fastapi
 boto3
 httpx
 schedule
+tenacity

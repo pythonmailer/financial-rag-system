@@ -65,14 +65,26 @@ if prompt := st.chat_input("E.g., What are the major supply chain risks?"):
                     # Display the exact SEC sources in an expandable box
                     with st.expander("📚 View SEC Sources"):
                         for i, source in enumerate(sources):
-                            # Grab the document_type (default to "Unknown" if it's from the cache fallback)
                             doc_type = source.get("document_type", "Unknown")
-                            
-                            # Add the document type to the bold header
                             st.markdown(f"**Source {i+1} ({doc_type}) | Relevance: {source.get('score', 1.0):.2f}:**")
                             st.caption(source.get('text', ''))
                             st.divider()
-                            
+
+                    # --- NEW: User Feedback Loop ---
+                    query_hash = data.get("query_hash")
+                    if query_hash:
+                        st.write("Was this answer helpful?")
+                        col1, col2, _ = st.columns([1, 1, 10]) # Keeps buttons small and aligned left
+                        
+                        with col1:
+                            if st.button("👍", key=f"up_{query_hash}"):
+                                requests.post("http://backend:8001/feedback", json={"query_hash": query_hash, "rating": 1})
+                                st.toast("✅ Positive feedback recorded!")
+                        with col2:
+                            if st.button("👎", key=f"down_{query_hash}"):
+                                requests.post("http://backend:8001/feedback", json={"query_hash": query_hash, "rating": -1})
+                                st.toast("📉 Negative feedback recorded for review.")
+
                     # Add AI response to chat history
                     st.session_state.messages.append({"role": "assistant", "content": answer})
                     

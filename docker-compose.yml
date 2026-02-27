@@ -10,6 +10,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -18,17 +19,23 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    restart: unless-stopped
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow
     command: >
       mlflow ui
+      --backend-store-uri sqlite:////mlruns/mlflow.db
+      --default-artifact-root /mlruns
       --host 0.0.0.0
       --port 5001
-      --allowed-hosts '*'
+      --allowed-hosts "*"
     ports:
       - "5001:5001"
+    volumes:
+      - mlflow_data:/mlruns  # Prevents loss of your cost & token metrics!
+    restart: unless-stopped
 
   backend:
     build: .
@@ -39,12 +46,30 @@ services:
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY} # Added OpenRouter Key
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
     depends_on:
       - postgres
       - qdrant
       - mlflow
+    restart: unless-stopped
+
+  backend_sequential:
+    build: .
+    container_name: rag_backend_sequential
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+    depends_on:
+      - postgres
+      - qdrant
+      - mlflow
+    restart: unless-stopped
 
   frontend:
     build: .
@@ -54,6 +79,7 @@ services:
       - "8501:8501"
     depends_on:
       - backend
+    restart: unless-stopped
 
   scheduler:
     build: .
@@ -63,7 +89,9 @@ services:
       - ./sec_data:/app/sec_data
     depends_on:
       - qdrant
+      - backend
 
 volumes:
   postgres_data:
   qdrant_data:
+  mlflow_data:

@@ -2,7 +2,7 @@
 
 An institutional-grade **Retrieval-Augmented Generation (RAG)** platform for ingesting, indexing, and analyzing SEC filings (**10-K, 10-Q, 8-K**) with ultra-low latency and high concurrency.
 
-The system is optimized for **stream batching + async multiplexing**, reducing latency from ~30 s (sequential RAG) to **~2.7 s for 10 concurrent queries**, while maintaining high answer quality through cross-encoder reranking and precise document source citation.
+The system is optimized for **stream batching + async multiplexing**, reducing latency from ~30 s (sequential RAG) to **~2.7 s for 10 concurrent queries**, while maintaining high answer quality through cross-encoder reranking, precise document source citation, and a verifiable evaluation pipeline.
 
 ---
 
@@ -32,24 +32,20 @@ This system introduces a **decoupled batch + async execution model**:
 
 ---
 
-## 🔁 Atomic Circuit Breaker & Cost-Aware Routing
+## 🔁 Enterprise Resilience & Cost-Aware Routing
 
-A lightweight LLM router classifies queries as:
+A lightweight LLM router classifies queries as **SIMPLE** (Llama-3.1-8B on Groq) or **COMPLEX** (Llama-3.3-70B on Groq).
 
-* **SIMPLE** → routed to **Llama-3.1-8B (Groq)** for low latency.
-* **COMPLEX** → routed to **Llama-3.3-70B (Groq)** for deep reasoning.
+To guarantee 99.9% uptime, the system employs a two-tier resilience layer:
 
-**Multi-Worker Safe Failover:**
-If Groq rate-limits (401) or fails, an atomic, POSIX-safe file-based Circuit Breaker triggers a 60-second cooldown across all Uvicorn workers. Traffic instantly and gracefully falls back to:
-
+1. **Exponential Backoff Retries (`tenacity`):** Automatically retries transient network errors (e.g., 502s) to prevent unnecessary quota burns.
+2. **Atomic Circuit Breaker:** If Groq rate-limits (401) or hard-fails, an atomic, multi-worker safe breaker triggers a 60-second cooldown. Traffic instantly falls back to:
 ➡️ **Gemini 2.5 Flash / Pro** → primary fallback
 ➡️ **OpenRouter Llama-3-8B** → secondary fallback
 
-This ensures **high availability + cost efficiency** without double-latency penalties.
-
 ---
 
-## ⚡ Exact-Match Cache with Targeted Invalidation (PostgreSQL)
+## ⚡ Exact-Match Cache & Implicit RLHF Loop (PostgreSQL)
 
 Queries are cryptographically hashed for instantaneous retrieval:
 
@@ -58,44 +54,31 @@ hash(ticker + normalized_query + document_type)
 
 ```
 
-* **Instantaneous:** ~2.7 s → ~7 ms latency for repeated queries.
-* **Event-Driven Targeted Invalidation:** When the background ingestion worker processes a new filing for a specific company (e.g., AAPL), it triggers a webhook (`DELETE /cache/clear/AAPL`) to surgically wipe only that company's stale cache, ensuring users always receive real-time financial data.
+* **Targeted Invalidation:** When the background worker ingests a new filing (e.g., AAPL), it triggers a REST webhook (`DELETE /cache/clear/AAPL`) to surgically wipe *only* that company's stale cache.
+* **Preference Dataset (RLHF):** The UI includes a Thumbs Up/Down feedback mechanism tied directly to the `query_hash`, silently building a ground-truth dataset for future model fine-tuning.
 
 ---
 
-## 🤖 Autonomous Filing Ingestion
+## 🧪 Offline Evaluation Pipeline
 
-An asynchronous background worker:
+Includes a dedicated `evaluate.py` testing suite to mathematically verify retrieval accuracy against a golden dataset of SEC questions.
 
-* Monitors the SEC EDGAR feed.
-* Detects new filings for configured tickers.
-* Downloads, chunks, embeds, tags with `document_type`, and upserts into Qdrant.
-* Triggers targeted semantic cache invalidation via REST webhook.
+* Measures **Hit@3** and **Hit@5** metrics.
+* Ensures recall rates remain above 90% when chunking strategies or embedding models are updated.
 
 ---
 
 # 📊 Observability (MLflow + OpenTelemetry)
 
-Every user query generates a **single MLflow trace** with nested spans:
-
-```text
-USER_QUERY
- ├── Retrieval_and_Rerank
- ├── Semantic_Router
- └── LLM_Generation
-
-```
+Every user query generates a **single MLflow trace** with nested spans capturing the complete lifecycle.
 
 ### Logged Metrics & Tags
 
+* **Unit Economics:** Tracks exact prompt/completion tokens and calculates **USD Cost Per Request** dynamically based on the active fallback provider.
 * `batch_size` & `cache_hit` boolean
 * `shared_embedding_latency_ms`
-* router decision (SIMPLE / COMPLEX)
-* provider used (Groq / Gemini / OpenRouter)
-* retrieved chunk count & `document_type`
-* final answer payload
-
-This enables latency vs. batch size analysis, provider cost tracking, and precise context inspection.
+* Router decision & final provider utilized
+* Retrieved chunk count & `document_type`
 
 ---
 
@@ -106,12 +89,12 @@ This enables latency vs. batch size analysis, provider cost tracking, and precis
 | Backend | FastAPI (async), Uvicorn, Pydantic |
 | Frontend | Streamlit |
 | Vector DB | Qdrant |
-| Cache DB | PostgreSQL |
+| Relational DB | PostgreSQL (Caching & Feedback) |
 | Embeddings | sentence-transformers |
 | Reranking | Cross-Encoder (MS MARCO) |
 | LLMs | Groq Llama-3, Gemini 2.5 Flash/Pro, OpenRouter |
 | Observability | MLflow, OpenTelemetry |
-| Automation | Async background worker, sec-edgar-downloader |
+| Resilience | Tenacity (Retries), Custom POSIX Circuit Breaker |
 | Infra | Docker, Docker Compose |
 
 ---
@@ -130,10 +113,6 @@ HF_TOKEN=your_key
 
 ```
 
-All fallbacks are optional — the system runs with Groq only.
-
----
-
 ## 2️⃣ Launch the Full Stack
 
 ```bash
@@ -141,17 +120,15 @@ docker-compose up --build -d
 
 ```
 
-This starts the FastAPI backend, Streamlit frontend, Qdrant, PostgreSQL, MLflow, and the ingestion worker.
-
----
+*Note: This starts the FastAPI backend (4 workers), Streamlit frontend, Qdrant, PostgreSQL, persistent MLflow, and the ingestion worker.*
 
 ## 3️⃣ Access Services
 
 | Service | URL |
 | --- | --- |
-| Analyst UI | [http://localhost:8501](https://www.google.com/search?q=http://localhost:8501) |
-| API Docs | [http://localhost:8001/docs](https://www.google.com/search?q=http://localhost:8001/docs) |
-| MLflow UI | [http://localhost:5001](https://www.google.com/search?q=http://localhost:5001) |
+| Analyst UI | http://localhost:8501 |
+| API Docs | http://localhost:8001/docs |
+| MLflow UI | http://localhost:5001 |
 
 ---
 
@@ -169,9 +146,7 @@ This starts the FastAPI backend, Streamlit frontend, Qdrant, PostgreSQL, MLflow,
 # 🔮 Roadmap
 
 * Hybrid BM25 + vector retrieval
-* Semantic (embedding) cache layer
-* Token usage + cost logging per provider
-* Recall@K evaluation pipeline
+* Semantic (embedding) cache layer (to compliment the exact-match hash cache)
 * GPU embedding worker pool
 * Multi-ticker ingestion orchestration
 
