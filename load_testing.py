@@ -2,12 +2,6 @@ import asyncio
 import httpx
 import time
 
-# ==========================================
-# ⚙️ TEST CONFIGURATION
-# ==========================================
-# Toggle this to test your different endpoints!
-# 8000 = Sequential Baseline (main.py)
-# 8001 = Batched Engine (main2.py)
 TARGET_PORT = 8000  
 
 BASE_URL = f"http://localhost:{TARGET_PORT}"
