@@ -159,6 +159,13 @@ def ready():
 
 @app.get("/queue_status")
 def queue_status():
+    return {
+        "mode": "sequential",
+        "queue_size": 0
+    }
+
+@app.get("/queue_status")
+def queue_status():
     return {"queue_size": request_queue.qsize() if request_queue else 0}
 
 # ==========================================

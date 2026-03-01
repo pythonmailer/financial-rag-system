@@ -116,6 +116,13 @@ def ready():
     except Exception as e:
         return {"status": "not_ready", "error": str(e)}
 
+@app.get("/queue_status")
+def queue_status():
+    return {
+        "mode": "sequential",
+        "queue_size": 0
+    }
+
 @app.post("/embed")
 def embed(req: EmbedRequest):
     if TESTING:
