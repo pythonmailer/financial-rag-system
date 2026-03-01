@@ -51,15 +51,14 @@ jobs:
           script: |
             cd ~/financial-rag-system
             
-            # 1. Create/Overwrite the .env file securely on the server
             echo "GROQ_API_KEY=$GROQ_API_KEY" > .env
             echo "GEMINI_API_KEY=$GEMINI_API_KEY" >> .env
             echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" >> .env
             echo "DATABASE_URL=$DATABASE_URL" >> .env
             echo "TESTING=False" >> .env
-            
-            # 2. Update code and reboot containers
+
             git pull origin main
+            sudo docker system prune -f 
             sudo docker-compose up -d --build
         env:
           # Maps GitHub Secrets to the variables used in the 'envs' field above
