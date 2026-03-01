@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -5,6 +7,8 @@ services:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: adminpassword
       POSTGRES_DB: financial_rag
+    ports:
+      - "5432:5432"   # optional but useful for debugging
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -13,6 +17,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -22,11 +27,11 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:6333/collections || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      start_period: 40s
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
@@ -69,11 +74,11 @@ services:
       mlflow:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8001/ready || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:8001/ready || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 40s
+      start_period: 50s
     restart: unless-stopped
 
   frontend:
