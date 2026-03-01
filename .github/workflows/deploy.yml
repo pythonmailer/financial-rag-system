@@ -10,7 +10,6 @@ jobs:
   # ==========================================
   test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -48,25 +47,25 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
-
     steps:
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env: # Correctly placed to map secrets to the action environment
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
+          # Maps the environment variables defined in 'env' to the shell script
           envs: GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY
-
           script: |
             set -e
-
             echo "🚀 Starting deployment..."
 
-            # ==========================================
-            # Ensure Docker exists (wipe-proof EC2)
-            # ==========================================
+            # Ensure Docker exists
             if ! command -v docker &> /dev/null; then
               echo "🐳 Installing Docker..."
               sudo apt update
@@ -74,46 +73,34 @@ jobs:
               sudo usermod -aG docker ubuntu
             fi
 
-            # ==========================================
-            # Clone repo if missing
-            # ==========================================
+            # Navigate to system directory or clone if missing
             if [ ! -d "$HOME/financial-rag-system" ]; then
-              echo "📦 Cloning repository..."
+              echo "📦 Repository not found. Cloning..."
               git clone https://github.com/pythonmailer/financial-rag-system ~/financial-rag-system
             fi
-
             cd ~/financial-rag-system
 
             echo "📥 Pulling latest code..."
             git fetch --all
             git reset --hard origin/main
 
+            echo "📝 Writing .env file..."
+            cat > .env <<EOF
+            GROQ_API_KEY=${GROQ_API_KEY}
+            GEMINI_API_KEY=${GEMINI_API_KEY}
+            OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+            DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
+            TESTING=False
+            USE_GPU=False
+            EOF
+
             echo "🧹 Cleaning old images (safe)..."
             sudo docker image prune -f
 
-            # ==========================================
-            # Write environment file (NO INDENTATION)
-            # ==========================================
-            echo "📝 Writing .env file..."
-            cat > .env <<EOF
-GROQ_API_KEY=${GROQ_API_KEY}
-GEMINI_API_KEY=${GEMINI_API_KEY}
-OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
-TESTING=False
-USE_GPU=False
-EOF
-
-            # ==========================================
-            # Build & start containers
-            # ==========================================
             echo "🔄 Rebuilding and starting containers..."
-            sudo docker compose pull
+            sudo docker compose pull || true
             sudo docker compose up -d --build
 
-            # ==========================================
-            # Wait for backend health
-            # ==========================================
             echo "⏳ Waiting for backend health..."
             for i in {1..30}; do
               if curl -s http://localhost:8001/ready | grep -q '"ready"'; then
@@ -124,17 +111,4 @@ EOF
               sleep 5
             done
 
-            # ==========================================
-            # Run Alembic migrations (after Postgres warmup)
-            # ==========================================
-            echo "⏳ Waiting for Postgres warmup..."
-            sleep 10
-
-            echo "📦 Running Alembic migrations..."
-            sudo docker compose exec -T backend alembic upgrade head
-
             echo "🎉 Deployment complete!"
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
