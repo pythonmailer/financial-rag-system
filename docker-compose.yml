@@ -11,7 +11,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U admin -d financial_rag"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
       start_period: 30s
 
   qdrant:
@@ -21,7 +21,6 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
-    # ❗ REMOVE healthcheck completely (it’s the problem)
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
@@ -37,7 +36,7 @@ services:
       - mlflow_data:/mlruns
     restart: unless-stopped
 
-    backend:
+  backend:
     build: .
     command: uvicorn main2:app --host 0.0.0.0 --port 8001
     ports:
@@ -55,8 +54,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
       mlflow:
         condition: service_started
     healthcheck:
@@ -95,8 +92,6 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
     restart: "no"
 
 volumes:
