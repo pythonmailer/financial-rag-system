@@ -37,7 +37,7 @@ if not TESTING:
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
 
-    mlflow.set_tracking_uri("http://mlflow:5001")
+    mlflow.set_tracking_uri("http://13.232.197.229:5001")
     mlflow.set_experiment("Financial-RAG")
     mlflow.openai.autolog()
 
