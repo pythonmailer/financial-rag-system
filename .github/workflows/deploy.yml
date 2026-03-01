@@ -87,11 +87,11 @@ jobs:
               sudo systemctl start docker
             fi
 
-            # Ensure Docker daemon is running
+            # Ensure daemon running
             sudo systemctl start docker || true
 
             # =========================
-            # Fallback docker-compose
+            # docker compose fallback
             # =========================
             if ! sudo docker compose version &> /dev/null; then
               echo "Installing docker-compose fallback..."
@@ -112,7 +112,7 @@ jobs:
             git reset --hard origin/main
 
             # =========================
-            # Write .env safely
+            # Write .env
             # =========================
             echo "Writing .env..."
             printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nDATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag\nTESTING=False\nUSE_GPU=False\nQDRANT_URL=http://qdrant:6333\nHF_TOKEN=\n" \
@@ -124,32 +124,66 @@ jobs:
             sudo docker compose down || sudo docker-compose down || true
 
             # =========================
-            # Clean images
+            # Clean old images
             # =========================
             sudo docker image prune -f || true
 
             # =========================
-            # Start containers
+            # Start core infra first
             # =========================
-            sudo docker compose up -d --build || sudo docker-compose up -d --build
+            echo "🔄 Starting postgres + qdrant + mlflow..."
+            sudo docker compose up -d postgres qdrant mlflow
+
+            # =========================
+            # Wait for Qdrant health
+            # =========================
+            echo "⏳ Waiting for Qdrant..."
+            for i in {1..30}; do
+              STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' financial-rag-system-qdrant-1 || echo "starting")
+
+              if [ "$STATUS" = "healthy" ]; then
+                echo "✅ Qdrant healthy"
+                break
+              fi
+
+              echo "Qdrant status: $STATUS ($i/30)"
+              sleep 5
+            done
+
+            STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' financial-rag-system-qdrant-1 || echo "unknown")
+            if [ "$STATUS" != "healthy" ]; then
+              echo "⚠️ Qdrant unhealthy → restarting once..."
+              sudo docker restart financial-rag-system-qdrant-1
+              sleep 10
+            fi
+
+            # =========================
+            # Start app services
+            # =========================
+            echo "🔄 Starting backend + ingestor + frontend..."
+            sudo docker compose up -d backend ingestor frontend
 
             # =========================
             # Wait for backend
             # =========================
-            echo "Waiting for backend..."
+            echo "⏳ Waiting for backend..."
             for i in {1..30}; do
               if curl -s http://localhost:8001/ready | grep -q '"ready"'; then
-                echo "Backend ready!"
+                echo "✅ Backend ready!"
                 break
               fi
+              echo "Backend not ready ($i/30)"
               sleep 5
             done
 
             # =========================
-            # Run Alembic if available
+            # Alembic (optional)
             # =========================
             if sudo docker compose exec -T backend alembic current &> /dev/null; then
+              echo "📦 Running migrations..."
               sudo docker compose exec -T backend alembic upgrade head || true
+            else
+              echo "ℹ️ Alembic not configured — skipping"
             fi
 
             echo "🎉 Deployment complete!"
