@@ -39,9 +39,6 @@ if not TESTING:
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
 
-    mlflow.set_tracking_uri("http://mlflow:5001")
-    mlflow.set_experiment("Financial-RAG")
-    mlflow.openai.autolog()
 else:
     SentenceTransformer = None
     CrossEncoder = None
@@ -156,13 +153,6 @@ def ready():
         return {"status": "ready"}
     except Exception as e:
         return {"status": "not_ready", "error": str(e)}
-
-@app.get("/queue_status")
-def queue_status():
-    return {
-        "mode": "sequential",
-        "queue_size": 0
-    }
 
 @app.get("/queue_status")
 def queue_status():
@@ -436,6 +426,16 @@ async def batch_processor():
 async def lifespan(app: FastAPI):
     global request_queue
     request_queue = asyncio.Queue()
+
+    if not TESTING:
+        try:
+            mlflow.set_tracking_uri("http://mlflow:5001")
+            mlflow.set_experiment("Financial-RAG")
+            mlflow.openai.autolog()
+            print("✅ MLflow initialized successfully.")
+        except Exception as e:
+            print(f"⚠️ MLflow initialization failed: {e}")
+
     task = asyncio.create_task(batch_processor())
     yield
     task.cancel()
