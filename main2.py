@@ -33,6 +33,23 @@ MAX_CONCURRENT_LLM_CALLS = 50
 # The Bouncer: Protects API rate limits
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
+TESTING = os.getenv("TESTING", "False") == "True"
+
+if not TESTING:
+    mlflow.set_tracking_uri("http://mlflow:5001")
+    mlflow.set_experiment("Financial-RAG")
+    mlflow.openai.autolog()
+
+    print("Loading AI Models (Embedder & Reranker)...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    qdrant = QdrantClient(url="http://qdrant:6333")
+else:
+    # If in GitHub Actions, use dummy variables to bypass the network
+    model = None
+    reranker = None
+    qdrant = None
+
 mlflow.set_tracking_uri("http://mlflow:5001")
 mlflow.set_experiment("Financial-RAG")
 mlflow.openai.autolog()

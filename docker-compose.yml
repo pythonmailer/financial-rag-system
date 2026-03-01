@@ -11,7 +11,6 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
-    # FIX 1: Healthcheck to tell other containers when DB is actually ready
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d financial_rag"]
       interval: 5s
@@ -50,6 +49,7 @@ services:
   backend:
     build: .
     container_name: rag_backend
+    # Pointing to your optimized batching engine
     command: uvicorn main2:app --host 0.0.0.0 --port 8001
     ports:
       - "8001:8001"
@@ -58,30 +58,8 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
-      # FIX 2: Explicitly pass the internal Docker connection strings
       - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
-    depends_on:
-      # FIX 3: Wait for databases to be strictly "healthy", not just "started"
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-      mlflow:
-        condition: service_started
-    restart: unless-stopped
-
-  backend_sequential:
-    build: .
-    container_name: rag_backend_sequential
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
-    environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - HF_TOKEN=${HF_TOKEN}
-      - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
+      - TESTING=False
     depends_on:
       postgres:
         condition: service_healthy
@@ -94,30 +72,34 @@ services:
   frontend:
     build: .
     container_name: rag_frontend
-    command: streamlit run frontend.py --server.port 8501
+    command: streamlit run frontend.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     environment:
-      # FIX 4: Tell Streamlit exactly where the backend is inside the Docker network
+      # Use the Docker service name 'backend' so Streamlit can find the API
       - BACKEND_URL=http://backend:8001
     depends_on:
       - backend
     restart: unless-stopped
 
-  scheduler:
+  ingestor:
     build: .
-    container_name: rag_scheduler
-    command: python scheduler.py
+    container_name: rag_ingestor
+    # This container runs once to populate data, then exits
+    command: python ingest.py
     volumes:
       - ./sec_data:/app/sec_data
     environment:
+      - QDRANT_URL=http://qdrant:6333
+      - BACKEND_URL=http://backend:8001
       - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
     depends_on:
       postgres:
         condition: service_healthy
       qdrant:
         condition: service_healthy
-    restart: unless-stopped
+    # We don't want the ingestor looping forever
+    restart: "no"
 
 volumes:
   postgres_data:

@@ -24,11 +24,14 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Pytest
+        env:
+          TESTING: "True"
+          DATABASE_URL: "sqlite:///./test_database.db"
         run: pytest tests.py
-
+        
   # --- STAGE 2: Continuous Deployment (AWS EC2) ---
   deploy:
-    needs: test # This ensures deployment ONLY happens if tests pass!
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: SSH into AWS and Deploy
@@ -37,12 +40,23 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          # We pass the secrets into the script environment
+          envs: GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, DATABASE_URL
           script: |
-            # Navigate to where your code lives on the server
-            cd ~/financial-rag-system 
+            cd ~/financial-rag-system
             
-            # Pull the new code from GitHub
+            # 1. Create/Overwrite the .env file securely on the server
+            echo "GROQ_API_KEY=$GROQ_API_KEY" > .env
+            echo "GEMINI_API_KEY=$GEMINI_API_KEY" >> .env
+            echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" >> .env
+            echo "DATABASE_URL=$DATABASE_URL" >> .env
+            echo "TESTING=False" >> .env
+            
+            # 2. Pull and Restart
             git pull origin main
-            
-            # Rebuild and restart the Docker containers in the background
             sudo docker-compose up -d --build
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DATABASE_URL: "postgresql://admin:adminpassword@postgres:5432/financial_rag"
