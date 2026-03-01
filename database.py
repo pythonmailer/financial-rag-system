@@ -11,29 +11,48 @@ TESTING = os.getenv("TESTING", "False") == "True"
 
 if TESTING:
     # Use an in-memory SQLite database for GitHub Actions tests
-    POSTGRES_URL = "sqlite:///./test_database.db"
+    POSTGRES_URL = os.getenv("DATABASE_URL", "sqlite:///./test_database.db")
     # SQLite requires 'check_same_thread: False' for FastAPI
     engine = create_engine(POSTGRES_URL, connect_args={"check_same_thread": False})
 else:
     # Production PostgreSQL connection
-    POSTGRES_URL = "postgresql://admin:adminpassword@postgres:5432/financial_rag"
+    POSTGRES_URL = os.getenv("DATABASE_URL", "postgresql://admin:adminpassword@postgres:5432/financial_rag")
     engine = create_engine(POSTGRES_URL)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# ... (Keep your FeedbackEntry and CacheEntry classes exactly as they are) ...
-
 # ==========================================
-# INFRASTRUCTURE INITIALIZATION
+# 1. DATABASE MODELS (Synced with main.py)
 # ==========================================
 
-# 1. Initialize SQLAlchemy Tables
+class FeedbackEntry(Base):
+    __tablename__ = "user_feedback"
+    id = Column(Integer, primary_key=True, index=True)
+    query_hash = Column(String, index=True)
+    rating = Column(Integer)  # 1 for Thumbs Up, -1 for Thumbs Down
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class CacheEntry(Base):
+    __tablename__ = "semantic_cache"
+    id = Column(Integer, primary_key=True, index=True)
+    query_hash = Column(String, unique=True, index=True) 
+    user_query = Column(Text)
+    llm_response = Column(Text)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ticker = Column(String, index=True)
+    provider = Column(String, nullable=True)
+
+# ==========================================
+# 2. INFRASTRUCTURE INITIALIZATION
+# ==========================================
+
+# Initialize SQLAlchemy Tables
 if TESTING:
     Base.metadata.create_all(bind=engine)
     print("✅ Successfully initialized local SQLite testing database.")
 else:
-    # Keep your original retry logic for production Postgres
+    # Retry logic for production Postgres (waits for Docker container to be ready)
     MAX_RETRIES = 5
     RETRY_DELAY = 3
     for attempt in range(MAX_RETRIES):
@@ -41,27 +60,35 @@ else:
             Base.metadata.create_all(bind=engine)
             print("✅ Successfully connected to PostgreSQL and verified tables.")
             break
-        except Exception:
+        except Exception as e:
             print(f"⏳ Waiting for PostgreSQL to be ready... (Attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(RETRY_DELAY)
     else:
-        print("❌ CRITICAL: Could not connect to PostgreSQL.")
+        print("❌ CRITICAL: Could not connect to PostgreSQL after multiple attempts.")
 
-# 2. Initialize Qdrant Collection (Bypass if Testing)
+# Initialize Qdrant Collection (Bypass if Testing)
 if not TESTING:
+    MAX_RETRIES = 5
+    RETRY_DELAY = 3
     for attempt in range(MAX_RETRIES):
         try:
-            qdrant = QdrantClient(url="http://qdrant:6333")
+            qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+            qdrant = QdrantClient(url=qdrant_url)
             collection_name = "financial_documents"
+            
             if not qdrant.collection_exists(collection_name):
                 qdrant.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(size=384, distance=Distance.COSINE),
                 )
-                print(f"✅ Qdrant collection '{collection_name}' created.")
+                print(f"✅ Qdrant collection '{collection_name}' created successfully.")
+            else:
+                print(f"✅ Connected to Qdrant. Collection '{collection_name}' already exists.")
             break
-        except Exception:
-            print(f"⏳ Waiting for Qdrant... (Attempt {attempt + 1}/{MAX_RETRIES})")
+        except Exception as e:
+            print(f"⏳ Waiting for Qdrant to be ready... (Attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(RETRY_DELAY)
+    else:
+        print("❌ CRITICAL: Could not connect to Qdrant after multiple attempts.")
 else:
     print("⏭️ Skipping Qdrant initialization (TESTING=True).")
