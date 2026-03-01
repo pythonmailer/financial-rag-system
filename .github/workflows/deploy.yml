@@ -119,13 +119,9 @@ jobs:
             "$GROQ_API_KEY" "$GEMINI_API_KEY" "$OPENROUTER_API_KEY" > .env
 
             # =========================
-            # Stop old containers
+            # Stop old containers & clean
             # =========================
             sudo docker compose down || sudo docker-compose down || true
-
-            # =========================
-            # Clean old images
-            # =========================
             sudo docker image prune -f || true
 
             # =========================
@@ -135,26 +131,43 @@ jobs:
             sudo docker compose up -d postgres qdrant mlflow
 
             # =========================
-            # Wait for Qdrant health
+            # Wait for Qdrant health (Dynamic ID)
             # =========================
             echo "⏳ Waiting for Qdrant..."
             for i in {1..30}; do
-              STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' financial-rag-system-qdrant-1 || echo "starting")
-
-              if [ "$STATUS" = "healthy" ]; then
-                echo "✅ Qdrant healthy"
-                break
+              QDRANT_ID=$(sudo docker compose ps -q qdrant)
+              if [ -n "$QDRANT_ID" ]; then
+                STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' $QDRANT_ID || echo "starting")
+                if [ "$STATUS" = "healthy" ]; then
+                  echo "✅ Qdrant healthy"
+                  break
+                fi
+              else
+                STATUS="starting"
               fi
-
+              
               echo "Qdrant status: $STATUS ($i/30)"
               sleep 5
             done
 
-            STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' financial-rag-system-qdrant-1 || echo "unknown")
+            QDRANT_ID=$(sudo docker compose ps -q qdrant)
+            STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' $QDRANT_ID || echo "unknown")
             if [ "$STATUS" != "healthy" ]; then
               echo "⚠️ Qdrant unhealthy → restarting once..."
-              sudo docker restart financial-rag-system-qdrant-1
+              sudo docker restart $QDRANT_ID
               sleep 10
+            fi
+
+            # =========================
+            # Alembic Migrations (Pre-Boot)
+            # =========================
+            # Using `run --rm` spins up a temporary backend container just for migrations,
+            # preventing the main backend from crashing if the DB isn't fully migrated yet.
+            echo "📦 Checking and running migrations..."
+            if sudo docker compose run --rm backend alembic current &> /dev/null; then
+              sudo docker compose run --rm backend alembic upgrade head || true
+            else
+              echo "ℹ️ Alembic not configured or failed — skipping"
             fi
 
             # =========================
@@ -175,15 +188,5 @@ jobs:
               echo "Backend not ready ($i/30)"
               sleep 5
             done
-
-            # =========================
-            # Alembic (optional)
-            # =========================
-            if sudo docker compose exec -T backend alembic current &> /dev/null; then
-              echo "📦 Running migrations..."
-              sudo docker compose exec -T backend alembic upgrade head || true
-            else
-              echo "ℹ️ Alembic not configured — skipping"
-            fi
 
             echo "🎉 Deployment complete!"
