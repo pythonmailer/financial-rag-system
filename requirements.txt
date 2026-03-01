@@ -1,20 +1,71 @@
+# ==============================
+# CORE API
+# ==============================
 fastapi
-uvicorn
+uvicorn[standard]
+pydantic
+python-dotenv
+httpx
+requests
+
+# ==============================
+# DATABASE
+# ==============================
 sqlalchemy
 psycopg2-binary
+alembic
+
+# ==============================
+# VECTOR DB
+# ==============================
 qdrant-client
-python-dotenv
+
+# ==============================
+# ML / EMBEDDINGS / RERANK
+# ==============================
+sentence-transformers
+torch
+numpy
+scikit-learn
+
+# ==============================
+# LLM CLIENTS
+# ==============================
+openai
+
+# ==============================
+# RAG INGESTION PIPELINE
+# ==============================
 sec-edgar-downloader
 beautifulsoup4
-sentence-transformers
 langchain-text-splitters
-openai
+
+# ==============================
+# FRONTEND
+# ==============================
 streamlit
-requests
+
+# ==============================
+# MLFLOW + GENAI TRACING
+# ==============================
 mlflow[genai]
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation
 opentelemetry-instrumentation-fastapi
-boto3
-httpx
-schedule
+
+# ==============================
+# ASYNC / RETRIES / SCHEDULING
+# ==============================
 tenacity
+schedule
+
+# ==============================
+# AWS (for future deployment)
+# ==============================
+boto3
+
+# ==============================
+# TESTING
+# ==============================
 pytest

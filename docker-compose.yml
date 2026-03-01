@@ -1,11 +1,12 @@
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: rag_postgres
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: adminpassword
       POSTGRES_DB: financial_rag
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d financial_rag"]
       interval: 10s
@@ -15,14 +16,13 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: qdrant
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -30,7 +30,6 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
-    container_name: mlflow
     command: >
       mlflow ui
       --backend-store-uri sqlite:////mlruns/mlflow.db
@@ -45,18 +44,23 @@ services:
 
   backend:
     build: .
-    container_name: rag_backend
-    # Pointing to your optimized batching engine
-    command: uvicorn main2:app --host 0.0.0.0 --port 8001
+    command: >
+      sh -c "
+      alembic upgrade head &&
+      uvicorn main2:app --host 0.0.0.0 --port 8001
+      "
     ports:
       - "8001:8001"
     environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - HF_TOKEN=${HF_TOKEN}
-      - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
-      - TESTING=False
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      HF_TOKEN: ${HF_TOKEN}
+      DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
+      TESTING: "False"
+      QDRANT_URL: http://qdrant:6333
+      PYTHONPATH: /app
+      USE_GPU: "false"
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,38 +68,44 @@ services:
         condition: service_healthy
       mlflow:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8001/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     restart: unless-stopped
 
   frontend:
     build: .
-    container_name: rag_frontend
     command: streamlit run frontend.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     environment:
-      # Use the Docker service name 'backend' so Streamlit can find the API
-      - BACKEND_URL=http://backend:8001
+      BACKEND_URL: http://backend:8001
+      PYTHONPATH: /app
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
   ingestor:
     build: .
-    container_name: rag_ingestor
-    # This container runs once to populate data, then exits
     command: python ingest.py
     volumes:
       - ./sec_data:/app/sec_data
     environment:
-      - QDRANT_URL=http://qdrant:6333
-      - BACKEND_URL=http://backend:8001
-      - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
+      QDRANT_URL: http://qdrant:6333
+      BACKEND_URL: http://backend:8001
+      DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
+      PYTHONPATH: /app
     depends_on:
+      backend:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       qdrant:
         condition: service_healthy
-    # We don't want the ingestor looping forever
     restart: "no"
 
 volumes:

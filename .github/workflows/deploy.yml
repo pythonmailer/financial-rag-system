@@ -1,22 +1,32 @@
 name: Financial RAG CI/CD Pipeline
 
-# Trigger this workflow every time you push to the 'main' branch
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
-  # --- STAGE 1: Continuous Integration (Testing) ---
+  # ==========================================
+  # STAGE 1: CI (TESTING)
+  # ==========================================
   test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.10
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install Dependencies
         run: |
@@ -25,44 +35,74 @@ jobs:
 
       - name: Run Pytest
         env:
-          # Bypasses heavy model loading and real DB connections
           TESTING: "True"
           DATABASE_URL: "sqlite:///./test_database.db"
-          
-          # Satisfies OpenAI client validation at import time
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: "test"
+          GEMINI_API_KEY: "test"
+          OPENROUTER_API_KEY: "test"
         run: pytest tests.py
-        
-  # --- STAGE 2: Continuous Deployment (AWS EC2) ---
+
+  # ==========================================
+  # STAGE 2: CD (AWS EC2)
+  # ==========================================
   deploy:
-    needs: test # Ensures deployment ONLY happens if tests pass!
+    needs: test
     runs-on: ubuntu-latest
+
     steps:
-      - name: SSH into AWS and Deploy
-        uses: appleboy/ssh-action@master
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          # Injects secrets into the shell environment of the remote server
-          envs: GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, DATABASE_URL
-          script: |
-            cd ~/financial-rag-system
-            
-            echo "GROQ_API_KEY=$GROQ_API_KEY" > .env
-            echo "GEMINI_API_KEY=$GEMINI_API_KEY" >> .env
-            echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" >> .env
-            echo "DATABASE_URL=$DATABASE_URL" >> .env
-            echo "TESTING=False" >> .env
+          script_stop: true
+          envs: GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY
 
-            git pull origin main
-            sudo docker system prune -f 
-            sudo docker-compose up -d --build
+          script: |
+            set -e
+
+            echo "🚀 Starting deployment..."
+
+            cd ~/financial-rag-system
+
+            echo "📥 Pulling latest code..."
+            git fetch --all
+            git reset --hard origin/main
+
+            echo "🧹 Cleaning old images (safe)..."
+            sudo docker image prune -f
+
+            echo "📝 Writing .env file..."
+            cat > .env <<EOF
+            GROQ_API_KEY=${GROQ_API_KEY}
+            GEMINI_API_KEY=${GEMINI_API_KEY}
+            OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+            DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
+            TESTING=False
+            USE_GPU=False
+            EOF
+
+            echo "🔄 Rebuilding and starting containers..."
+            sudo docker compose pull
+            sudo docker compose up -d --build
+
+            echo "⏳ Waiting for backend health..."
+            for i in {1..30}; do
+              if curl -s http://localhost:8001/ready | grep -q '"ready"'; then
+                echo "✅ Backend is healthy!"
+                break
+              fi
+              echo "⏳ Waiting for backend... ($i/30)"
+              sleep 5
+            done
+
+            echo "📦 Running Alembic migrations..."
+            sudo docker compose exec -T backend alembic upgrade head || true
+
+            echo "🎉 Deployment complete!"
+
         env:
-          # Maps GitHub Secrets to the variables used in the 'envs' field above
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          DATABASE_URL: "postgresql://admin:adminpassword@postgres:5432/financial_rag"
