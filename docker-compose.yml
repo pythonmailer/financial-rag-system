@@ -11,6 +11,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    # FIX 1: Healthcheck to tell other containers when DB is actually ready
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d financial_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -20,6 +26,11 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
@@ -30,11 +41,10 @@ services:
       --default-artifact-root /mlruns
       --host 0.0.0.0
       --port 5001
-      --allowed-hosts "*"
     ports:
       - "5001:5001"
     volumes:
-      - mlflow_data:/mlruns  # Prevents loss of your cost & token metrics!
+      - mlflow_data:/mlruns
     restart: unless-stopped
 
   backend:
@@ -48,10 +58,16 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
+      # FIX 2: Explicitly pass the internal Docker connection strings
+      - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
     depends_on:
-      - postgres
-      - qdrant
-      - mlflow
+      # FIX 3: Wait for databases to be strictly "healthy", not just "started"
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
     restart: unless-stopped
 
   backend_sequential:
@@ -65,10 +81,14 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
+      - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
     depends_on:
-      - postgres
-      - qdrant
-      - mlflow
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
     restart: unless-stopped
 
   frontend:
@@ -77,6 +97,9 @@ services:
     command: streamlit run frontend.py --server.port 8501
     ports:
       - "8501:8501"
+    environment:
+      # FIX 4: Tell Streamlit exactly where the backend is inside the Docker network
+      - BACKEND_URL=http://backend:8001
     depends_on:
       - backend
     restart: unless-stopped
@@ -87,9 +110,14 @@ services:
     command: python scheduler.py
     volumes:
       - ./sec_data:/app/sec_data
+    environment:
+      - DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
     depends_on:
-      - qdrant
-      - backend
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

@@ -40,3 +40,4 @@ __pycache__/
 # Ignore IDE settings (VS Code, PyCharm)
 .vscode/
 .idea/
+*.pem

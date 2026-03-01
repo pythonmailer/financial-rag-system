@@ -122,6 +122,14 @@ docker-compose up --build -d
 
 *Note: This starts the FastAPI backend (4 workers), Streamlit frontend, Qdrant, PostgreSQL, persistent MLflow, and the ingestion worker.*
 
+> **🧠 Model Downloading Note:** On the very first boot, the system will automatically download the `all-MiniLM-L6-v2` and `ms-marco` models from Hugging Face. The backend container may take 1-2 minutes to fully start up while these weights are cached.
+
+```
+
+Additionally, this is exactly why we included `HF_TOKEN=your_key` in the `.env` setup in the README! If someone is downloading from a corporate network, Hugging Face might rate-limit their automatic download unless they provide that token.
+
+```
+
 ## 3️⃣ Access Services
 
 | Service | URL |
