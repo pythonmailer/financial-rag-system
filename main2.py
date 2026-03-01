@@ -13,21 +13,11 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
-import mlflow
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from openai import AsyncOpenAI
 from database import SessionLocal, CacheEntry, FeedbackEntry
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 load_dotenv()
 
-# ==========================================
-# CONFIG
-# ==========================================
+TESTING = os.getenv("TESTING", "False") == "True"
 USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 COLLECTION_NAME = "financial_documents"
@@ -38,31 +28,94 @@ MAX_CONCURRENT_LLM_CALLS = 50
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
 # ==========================================
-# LAZY MODELS
+# 🧪 TESTING FAST PATH (no heavy imports)
+# ==========================================
+if not TESTING:
+    import mlflow
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models
+    from openai import AsyncOpenAI
+    from tenacity import retry, wait_exponential, stop_after_attempt
+
+    mlflow.set_tracking_uri("http://mlflow:5001")
+    mlflow.set_experiment("Financial-RAG")
+    mlflow.openai.autolog()
+else:
+    SentenceTransformer = None
+    CrossEncoder = None
+    QdrantClient = None
+    models = None
+    AsyncOpenAI = None
+    retry = lambda *a, **k: (lambda f: f)
+    wait_exponential = None
+    stop_after_attempt = None
+
+# ==========================================
+# LAZY MODELS (production only)
 # ==========================================
 @lru_cache()
 def get_embedder():
+    if TESTING:
+        return None
     device = "cuda" if USE_GPU else "cpu"
     return SentenceTransformer("BAAI/bge-small-en-v1.5", device=device)
 
 @lru_cache()
 def get_reranker():
+    if TESTING:
+        return None
     device = "cuda" if USE_GPU else "cpu"
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
 
 @lru_cache()
 def get_qdrant():
+    if TESTING:
+        return None
     return QdrantClient(url=QDRANT_URL)
 
 # ==========================================
-# MLflow
+# LLM CLIENTS (production only)
 # ==========================================
-mlflow.set_tracking_uri("http://mlflow:5001")
-mlflow.set_experiment("Financial-RAG")
-mlflow.openai.autolog()
+if not TESTING:
+    primary_client = AsyncOpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=os.getenv("GROQ_API_KEY"),
+    )
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    gemini_client = (
+        AsyncOpenAI(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=gemini_key,
+        )
+        if gemini_key
+        else None
+    )
+
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    openrouter_client = (
+        AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
+        if openrouter_key
+        else None
+    )
+else:
+    primary_client = None
+    gemini_client = None
+    openrouter_client = None
 
 # ==========================================
-# DATABASE DEPENDENCY
+# APP INIT
+# ==========================================
+app = FastAPI(title="Financial RAG API - Stream-Batched")
+
+if not TESTING:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    FastAPIInstrumentor.instrument_app(app)
+
+# ==========================================
+# DB DEP
 # ==========================================
 def get_db():
     db = SessionLocal()
@@ -88,17 +141,16 @@ class EmbedRequest(BaseModel):
     texts: list[str]
 
 # ==========================================
-# HEALTH ENDPOINTS
+# HEALTH
 # ==========================================
-app = FastAPI(title="Financial RAG API - Stream-Batched")
-FastAPIInstrumentor.instrument_app(app)
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.get("/ready")
 def ready():
+    if TESTING:
+        return {"status": "ready"}
     try:
         get_qdrant().get_collections()
         return {"status": "ready"}
@@ -110,10 +162,12 @@ def queue_status():
     return {"queue_size": request_queue.qsize() if request_queue else 0}
 
 # ==========================================
-# EMBED ENDPOINT (used by ingestor)
+# EMBED ENDPOINT
 # ==========================================
 @app.post("/embed")
 def embed(req: EmbedRequest):
+    if TESTING:
+        return {"embeddings": [[0.0] * 384 for _ in req.texts]}
     embedder = get_embedder()
     vectors = embedder.encode(req.texts)
     return {"embeddings": vectors.tolist()}
@@ -161,74 +215,65 @@ gemini_breaker = CircuitBreaker("gemini")
 openrouter_breaker = CircuitBreaker("openrouter")
 
 # ==========================================
-# LLM CLIENTS
-# ==========================================
-primary_client = AsyncOpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv("GROQ_API_KEY"),
-)
-
-gemini_key = os.getenv("GEMINI_API_KEY")
-gemini_client = (
-    AsyncOpenAI(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        api_key=gemini_key,
-    )
-    if gemini_key
-    else None
-)
-
-openrouter_key = os.getenv("OPENROUTER_API_KEY")
-openrouter_client = (
-    AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
-    if openrouter_key
-    else None
-)
-
-# ==========================================
-# RETRIEVAL + RERANK
+# RETRIEVAL
 # ==========================================
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
-    if TESTING or not qdrant:
+    if TESTING:
+        return type("obj", (object,), {"points": []})
+
+    qdrant = get_qdrant()
+    if not qdrant:
         return type("obj", (object,), {"points": []})
 
     try:
-        must_conditions = [
+        must = [
             models.FieldCondition(
                 key="ticker",
-                match=models.MatchValue(value=ticker.upper())
+                match=models.MatchValue(value=ticker.upper()),
             )
         ]
-
         if document_type:
-            must_conditions.append(
+            must.append(
                 models.FieldCondition(
                     key="document_type",
-                    match=models.MatchValue(value=document_type.upper())
+                    match=models.MatchValue(value=document_type.upper()),
                 )
             )
 
         return qdrant.query_points(
-            collection_name="financial_documents",
+            collection_name=COLLECTION_NAME,
             query=query_vector,
             limit=limit,
-            query_filter=models.Filter(must=must_conditions)
+            query_filter=models.Filter(must=must),
         )
     except Exception:
         return type("obj", (object,), {"points": []})
 
+# ==========================================
+# RERANK
+# ==========================================
 def rerank_documents(query, texts, top_k):
+    if TESTING or not texts:
+        idx = list(range(min(top_k, len(texts))))
+        scores = np.zeros(len(texts))
+        return idx, scores
+
     reranker = get_reranker()
     scores = reranker.predict([[query, t] for t in texts])
     idx = np.argsort(scores)[::-1][:top_k]
     return idx, scores
 
+# ==========================================
+# EMBED BATCH
+# ==========================================
 def embed_query_batch(queries):
+    if TESTING:
+        return [[0.0] * 384 for _ in queries]
     embedder = get_embedder()
     return embedder.encode(queries).tolist()
 
 # ==========================================
-# CACHE HELPERS
+# CACHE SAVE
 # ==========================================
 def save_to_cache(q_hash, user_query, llm_response, ticker, provider):
     db = SessionLocal()
@@ -243,7 +288,7 @@ def save_to_cache(q_hash, user_query, llm_response, ticker, provider):
             )
         )
         db.commit()
-    except Exception:
+    except:
         db.rollback()
     finally:
         db.close()
@@ -251,25 +296,25 @@ def save_to_cache(q_hash, user_query, llm_response, ticker, provider):
 # ==========================================
 # SAFE LLM CALL
 # ==========================================
-@retry(wait=wait_exponential(min=2, max=6), stop=stop_after_attempt(3))
-async def safe_llm_call(client, model_name, messages, max_tokens=None):
-    kwargs = {"model": model_name, "messages": messages, "temperature": 0.2}
-    if max_tokens:
-        kwargs["max_tokens"] = max_tokens
-    return await asyncio.wait_for(client.chat.completions.create(**kwargs), timeout=12)
+if not TESTING:
+    @retry(wait=wait_exponential(min=2, max=6), stop=stop_after_attempt(3))
+    async def safe_llm_call(client, model_name, messages):
+        return await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.2,
+            ),
+            timeout=12,
+        )
 
 # ==========================================
-# SIMPLE ROUTER (kept lightweight)
-# ==========================================
-async def route_query(query: str):
-    if len(query) < 120:
-        return "SIMPLE", "Groq"
-    return "COMPLEX", "Groq"
-
-# ==========================================
-# GENERATION WITH FALLBACK
+# GENERATION
 # ==========================================
 async def generate_answer(system_prompt, user_query):
+    if TESTING:
+        return "Mock financial analysis response.", "MockProvider"
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_query},
@@ -279,23 +324,25 @@ async def generate_answer(system_prompt, user_query):
         try:
             resp = await safe_llm_call(primary_client, "llama-3.1-8b-instant", messages)
             return resp.choices[0].message.content, "Groq"
-        except Exception:
+        except:
             groq_breaker.trip()
 
     if gemini_client and gemini_breaker.is_healthy:
         try:
             resp = await safe_llm_call(gemini_client, "gemini-2.5-flash", messages)
             return resp.choices[0].message.content, "Gemini"
-        except Exception:
+        except:
             gemini_breaker.trip()
 
     if openrouter_client and openrouter_breaker.is_healthy:
         try:
             resp = await safe_llm_call(
-                openrouter_client, "meta-llama/llama-3.1-8b-instruct", messages
+                openrouter_client,
+                "meta-llama/llama-3.1-8b-instruct",
+                messages,
             )
             return resp.choices[0].message.content, "OpenRouter"
-        except Exception:
+        except:
             openrouter_breaker.trip()
 
     return "⚠️ All providers unavailable.", "System Degraded"
@@ -319,10 +366,13 @@ async def process_independently(i, fut, req, batch_vectors):
                 idx, scores = await asyncio.to_thread(
                     rerank_documents, req.query, texts, req.top_k
                 )
-
                 combined = "\n\n".join([texts[j] for j in idx])
                 sources = [
-                    {"score": float(scores[j]), "text": texts[j], "document_type": "SEC Filing"}
+                    {
+                        "score": float(scores[j]),
+                        "text": texts[j],
+                        "document_type": "SEC Filing",
+                    }
                     for j in idx
                 ]
 
@@ -336,7 +386,9 @@ async def process_independently(i, fut, req, batch_vectors):
             ).hexdigest()
 
             asyncio.create_task(
-                asyncio.to_thread(save_to_cache, q_hash, req.query, answer, req.ticker, provider)
+                asyncio.to_thread(
+                    save_to_cache, q_hash, req.query, answer, req.ticker, provider
+                )
             )
 
             fut.set_result(
@@ -399,7 +451,7 @@ def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 # ==========================================
-# ASK ENDPOINT
+# ASK
 # ==========================================
 @app.post("/ask")
 async def ask(req: QueryRequest, db: Session = Depends(get_db)):
@@ -411,7 +463,9 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
             "query_hash": q_hash,
             "query": req.query,
             "answer": cached.llm_response,
-            "sources": [{"score": 1.0, "text": "Semantic Cache", "document_type": "Cache"}],
+            "sources": [
+                {"score": 1.0, "text": "Semantic Cache", "document_type": "Cache"}
+            ],
             "cached": True,
             "provider": "Cache",
         }
