@@ -25,13 +25,19 @@ jobs:
 
       - name: Run Pytest
         env:
+          # Bypasses heavy model loading and real DB connections
           TESTING: "True"
           DATABASE_URL: "sqlite:///./test_database.db"
+          
+          # Satisfies OpenAI client validation at import time
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: pytest tests.py
         
   # --- STAGE 2: Continuous Deployment (AWS EC2) ---
   deploy:
-    needs: test
+    needs: test # Ensures deployment ONLY happens if tests pass!
     runs-on: ubuntu-latest
     steps:
       - name: SSH into AWS and Deploy
@@ -40,7 +46,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          # We pass the secrets into the script environment
+          # Injects secrets into the shell environment of the remote server
           envs: GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, DATABASE_URL
           script: |
             cd ~/financial-rag-system
@@ -52,10 +58,11 @@ jobs:
             echo "DATABASE_URL=$DATABASE_URL" >> .env
             echo "TESTING=False" >> .env
             
-            # 2. Pull and Restart
+            # 2. Update code and reboot containers
             git pull origin main
             sudo docker-compose up -d --build
         env:
+          # Maps GitHub Secrets to the variables used in the 'envs' field above
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
