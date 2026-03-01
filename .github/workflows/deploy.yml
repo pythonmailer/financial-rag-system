@@ -1,56 +1,11 @@
-name: Financial RAG CI/CD Pipeline
-
-on:
-  push:
-    branches: ["main"]
-
-jobs:
-  # ==========================================
-  # STAGE 1: CI (TESTING)
-  # ==========================================
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Pytest
-        env:
-          TESTING: "True"
-          DATABASE_URL: "sqlite:///./test_database.db"
-          GROQ_API_KEY: "test"
-          GEMINI_API_KEY: "test"
-          OPENROUTER_API_KEY: "test"
-        run: pytest tests.py
-
-  # ==========================================
-  # STAGE 2: CD (AWS EC2)
-  # ==========================================
   deploy:
     needs: test
     runs-on: ubuntu-latest
+
     steps:
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
-        env: # Correctly placed to map secrets to the action environment
+        env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -59,31 +14,72 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
-          # Maps the environment variables defined in 'env' to the shell script
           envs: GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY
           script: |
             set -e
             echo "🚀 Starting deployment..."
 
-            # Ensure Docker exists
+            # ==========================================
+            # 1️⃣ Install Docker (official repo) if missing
+            # ==========================================
             if ! command -v docker &> /dev/null; then
-              echo "🐳 Installing Docker..."
+              echo "🐳 Installing Docker (official)..."
+
               sudo apt update
-              sudo apt install docker.io docker-compose-plugin -y
-              sudo usermod -aG docker ubuntu
+              sudo apt install -y ca-certificates curl gnupg
+
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+                sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+              echo \
+                "deb [arch=$(dpkg --print-architecture) \
+                signed-by=/etc/apt/keyrings/docker.gpg] \
+                https://download.docker.com/linux/ubuntu \
+                $(. /etc/os-release && echo $VERSION_CODENAME) stable" | \
+                sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+              sudo apt update
+              sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+              sudo systemctl enable docker
+              sudo systemctl start docker
             fi
 
-            # Navigate to system directory or clone if missing
+            # ==========================================
+            # 2️⃣ Ensure docker group permissions
+            # ==========================================
+            sudo usermod -aG docker ubuntu || true
+
+            # ==========================================
+            # 3️⃣ Verify docker compose (self-heal fallback)
+            # ==========================================
+            if ! docker compose version &> /dev/null; then
+              echo "⚠️ docker compose plugin missing → installing fallback docker-compose binary..."
+              sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+                -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
+              alias docker-compose='docker-compose'
+            fi
+
+            # ==========================================
+            # 4️⃣ Clone repo if missing
+            # ==========================================
             if [ ! -d "$HOME/financial-rag-system" ]; then
-              echo "📦 Repository not found. Cloning..."
+              echo "📦 Cloning repository..."
               git clone https://github.com/pythonmailer/financial-rag-system ~/financial-rag-system
             fi
+
             cd ~/financial-rag-system
 
             echo "📥 Pulling latest code..."
             git fetch --all
             git reset --hard origin/main
 
+            # ==========================================
+            # 5️⃣ Write .env
+            # ==========================================
             echo "📝 Writing .env file..."
             cat > .env <<EOF
             GROQ_API_KEY=${GROQ_API_KEY}
@@ -92,15 +88,31 @@ jobs:
             DATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag
             TESTING=False
             USE_GPU=False
+            QDRANT_URL=http://qdrant:6333
             EOF
 
-            echo "🧹 Cleaning old images (safe)..."
-            sudo docker image prune -f
+            # ==========================================
+            # 6️⃣ Stop old containers safely
+            # ==========================================
+            echo "🛑 Stopping old containers (if any)..."
+            docker compose down || true
+            docker-compose down || true
 
+            # ==========================================
+            # 7️⃣ Clean unused images (safe)
+            # ==========================================
+            echo "🧹 Cleaning old images..."
+            docker image prune -f || true
+
+            # ==========================================
+            # 8️⃣ Start stack (supports both compose syntaxes)
+            # ==========================================
             echo "🔄 Rebuilding and starting containers..."
-            sudo docker compose pull || true
-            sudo docker compose up -d --build
+            docker compose up -d --build || docker-compose up -d --build
 
+            # ==========================================
+            # 9️⃣ Wait for backend health
+            # ==========================================
             echo "⏳ Waiting for backend health..."
             for i in {1..30}; do
               if curl -s http://localhost:8001/ready | grep -q '"ready"'; then
@@ -110,5 +122,15 @@ jobs:
               echo "⏳ Waiting for backend... ($i/30)"
               sleep 5
             done
+
+            # ==========================================
+            # 🔟 Run Alembic migrations if available
+            # ==========================================
+            if docker compose exec -T backend alembic current &> /dev/null; then
+              echo "📦 Running Alembic migrations..."
+              docker compose exec -T backend alembic upgrade head || true
+            else
+              echo "ℹ️ Alembic not configured — skipping migrations"
+            fi
 
             echo "🎉 Deployment complete!"
