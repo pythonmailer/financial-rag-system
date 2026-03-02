@@ -149,19 +149,27 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
                     st.error(f"Connection Error: {e}")
 
             # 🛑 EXECUTE OUTSIDE THE SPINNER TO PREVENT INFINITE LOOPING 🛑
-            if response and response.status_code == 200:
-                data = response.json()
-                answer = data.get("answer", "No analysis available.")
-                sources = data.get("sources", [])
-                
-                st.session_state.last_answer = answer
-                st.session_state.last_sources = sources
-                st.session_state.last_provider = data.get("provider", "LLM")
-                st.session_state.last_cached = data.get("cached", False)
+            if response.status_code == 200:
+                        data = response.json()
 
-                # Stream text safely
-                st.write_stream(stream_tokens(answer))
-                st.session_state.streaming_done = True
+                        answer = data.get("answer", "No analysis available.")
+                        
+                        # 🚨 THE FIX: Stop Streamlit from turning money into green math equations
+                        answer = answer.replace("$", r"\$")
+                        
+                        sources = data.get("sources", [])
+                        provider = data.get("provider", "LLM")
+                        is_cached = data.get("cached", False)
+
+                        # SAVE STATE
+                        st.session_state.last_answer = answer
+                        st.session_state.last_sources = sources
+                        st.session_state.last_provider = provider
+                        st.session_state.last_cached = is_cached
+
+                        # Stream text safely
+                        st.write_stream(stream_tokens(answer))
+                        st.session_state.streaming_done = True
 
             elif response:
                 st.error(f"Analysis failed. Backend returned: {response.status_code}")
