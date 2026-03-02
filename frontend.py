@@ -152,29 +152,29 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
                     st.error(f"Connection Error: {e}")
 
             # 🛑 EXECUTE OUTSIDE THE SPINNER TO PREVENT INFINITE LOOPING 🛑
-            if response.status_code == 200:
-                        data = response.json()
+            if response is not None and response.status_code == 200:
+                data = response.json()
 
-                        answer = data.get("answer", "No analysis available.")
-                        
-                        # 🚨 THE FIX: Stop Streamlit from turning money into green math equations
-                        answer = answer.replace("$", r"\$")
-                        
-                        sources = data.get("sources", [])
-                        provider = data.get("provider", "LLM")
-                        is_cached = data.get("cached", False)
+                answer = data.get("answer", "No analysis available.")
+                
+                # 🚨 THE FIX: Stop Streamlit from turning money into green math equations
+                answer = answer.replace("$", r"\$")
+                
+                sources = data.get("sources", [])
+                provider = data.get("provider", "LLM")
+                is_cached = data.get("cached", False)
 
-                        # SAVE STATE
-                        st.session_state.last_answer = answer
-                        st.session_state.last_sources = sources
-                        st.session_state.last_provider = provider
-                        st.session_state.last_cached = is_cached
+                # SAVE STATE
+                st.session_state.last_answer = answer
+                st.session_state.last_sources = sources
+                st.session_state.last_provider = provider
+                st.session_state.last_cached = is_cached
 
-                        # Stream text safely
-                        st.write_stream(stream_tokens(answer))
-                        st.session_state.streaming_done = True
+                # Stream text safely
+                st.write_stream(stream_tokens(answer))
+                st.session_state.streaming_done = True
 
-            elif response:
+            elif response is not None:
                 st.error(f"Analysis failed. Backend returned: {response.status_code}")
 
         else:
@@ -200,22 +200,22 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
     # SOURCE EVIDENCE
     # ======================================
     if st.session_state.last_sources:
-            with st.expander("📚 View Document Evidence"):
-                for i, src in enumerate(st.session_state.last_sources):
-                    
-                    # 1. Get the raw cross-encoder score (e.g. 5.24)
-                    raw_score = src.get("score", 0.0)
-                    
-                    # 2. Use the normalize function to squash it to 0.0 - 1.0
-                    normalized_score = normalize_score(raw_score)
-                    
-                    # 3. Double-clamp it just to be 100% safe for Streamlit
-                    safe_score = max(0.0, min(1.0, float(normalized_score)))
+        with st.expander("📚 View Document Evidence"):
+            for i, src in enumerate(st.session_state.last_sources):
+                
+                # 1. Get the raw cross-encoder score (e.g. 5.24)
+                raw_score = src.get("score", 0.0)
+                
+                # 2. Use the normalize function to squash it to 0.0 - 1.0
+                normalized_score = normalize_score(raw_score)
+                
+                # 3. Double-clamp it just to be 100% safe for Streamlit
+                safe_score = max(0.0, min(1.0, float(normalized_score)))
 
-                    st.markdown(f"**Chunk {i+1}** | Relevancy: `{safe_score:.2%}`")
-                    st.progress(safe_score) # Now guaranteed to be valid!
-                    st.caption(src.get("text", "")[:400] + "...")
-                    st.divider()
+                st.markdown(f"**Chunk {i+1}** | Relevancy: `{safe_score:.2%}`")
+                st.progress(safe_score) # Now guaranteed to be valid!
+                st.caption(src.get("text", "")[:400] + "...")
+                st.divider()
 
     # ======================================
     # SAVE ASSISTANT MESSAGE ONCE
