@@ -24,7 +24,6 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
     healthcheck:
-      # This checks if the port is open without needing curl installed
       test: ["CMD-SHELL", "timeout 1s bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 20s
       timeout: 5s
@@ -33,7 +32,6 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
-    # Removed container_name to let Docker Compose handle DNS via service name 'mlflow'
     command: >
       mlflow server
       --backend-store-uri sqlite:////mlruns/mlflow.db
