@@ -13,7 +13,6 @@ from functools import lru_cache
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Depends
-from mlflow.entities import SpanType
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
@@ -169,7 +168,8 @@ def embed_query_batch(queries):
     return get_embedder().encode(queries).tolist()
 
 async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
-    with start_span(name="LLM_Generation", span_type=SpanType.LLM) as span:
+    # STRICT FORMAT: "LLM" string type, output is exactly the answer text
+    with start_span(name="LLM_Generation", span_type="LLM") as span:
         if TESTING: return "Mock answer.", "Mock"
         msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
         groq_model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
@@ -180,7 +180,7 @@ async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
                 ans = res.choices[0].message.content
                 if span:
                     span.set_attribute("llm_model", groq_model)
-                    span.set_outputs({"llm_answer": ans})
+                    span.set_outputs(ans)
                 return ans, f"Groq ({groq_model})"
             except: groq_breaker.trip()
         return "⚠️ LLM Service Degraded.", "System Offline"
@@ -201,11 +201,9 @@ MLFLOW_CLIENT = None
 # ==========================================
 @trace(name="RAG_Workflow")
 async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time):
-    # Retrieve the global client
     global MLFLOW_CLIENT
     client = MLFLOW_CLIENT
 
-    # Grab the automatically created root span to add global inputs/outputs
     root_span = None
     if not TESTING:
         root_span = mlflow.get_current_active_span()
@@ -215,45 +213,45 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
     async with llm_semaphore:
         try:
             # --- STEP 1: ROUTER ---
-            with start_span(name="1_Query_Routing", span_type=SpanType.TOOL) as span:
+            with start_span(name="1_Query_Routing", span_type="TOOL") as span:
                 complexity = route_query(req.query)
-                span.set_outputs({"routing_result": complexity})
+                span.set_outputs(complexity)
 
             # --- STEP 2: RETRIEVAL ---
-            with start_span(name="2_Vector_Retrieval", span_type=SpanType.RETRIEVER) as span:
-                span.set_attribute("span_type", "RETRIEVER")
+            # STRICT FORMAT: "RETRIEVER" string type, output is a list of strings
+            with start_span(name="2_Vector_Retrieval", span_type="RETRIEVER") as span:
                 t_start = time.time()
                 search = await asyncio.to_thread(retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type)
                 q_latency = (time.time() - t_start) * 1000
                 
                 texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
                 span.set_attribute("qdrant_latency_ms", q_latency)
-                span.set_outputs({"retrieved_count": len(texts), "retrieved_texts": texts})
+                span.set_outputs(texts)
 
             if not texts:
                 combined, sources = "No context found.", []
                 rerank_ms = 0
             else:
                 # --- STEP 3: RERANKING ---
-                with start_span(name="3_Reranking", span_type=SpanType.TOOL) as span:
+                with start_span(name="3_Reranking", span_type="TOOL") as span:
                     t_rerank = time.time()
                     idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
                     rerank_ms = (time.time() - t_rerank) * 1000
                     
                     combined = "\n\n".join([texts[j] for j in idx])
                     sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
-                    span.set_outputs({"reranked_top_k": len(idx)})
+                    span.set_outputs([texts[j] for j in idx])
 
             # --- STEP 4: LLM GENERATION ---
             answer, provider = await generate_answer(f"Analyst context:\n{combined}", req.query, complexity)
 
             if root_span:
-                root_span.set_outputs({"final_answer": answer, "provider": provider})
+                # STRICT FORMAT: Root span output is exactly the final text
+                root_span.set_outputs(answer)
 
             # --- MLflow CHRONOLOGICAL METRICS LOGGING ---
             if not TESTING and root_span and client:
                 try:
-                    # MLflow traces automatically tie request_id to the Run ID
                     run_id = root_span.request_id 
                     ts_ms = int(time.time() * 1000)
                     client.log_metric(run_id, "qdrant_ms", float(q_latency), ts_ms)
@@ -280,7 +278,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
 async def batch_processor():
     while True:
         batch = []
-        # Notice we no longer pull run_id from the queue, @trace handles it
         fut, req, q_hash, ctx, req_arrival_time = await request_queue.get()
         batch.append((fut, req, q_hash, ctx, req_arrival_time))
         await asyncio.sleep(0.05)
@@ -288,7 +285,7 @@ async def batch_processor():
             batch.append(request_queue.get_nowait())
 
         queries = [item[1].query for item in batch]
-        with start_span(name="Batch_Embedding", span_type=SpanType.TOOL) as span:
+        with start_span(name="Batch_Embedding", span_type="TOOL") as span:
             vectors = await asyncio.to_thread(embed_query_batch, queries)
 
         for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
@@ -322,7 +319,6 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     cached = db.query(CacheEntry).filter(CacheEntry.query_hash == q_hash, CacheEntry.ticker == req.ticker).first()
     if cached: return {"answer": cached.llm_response, "cached": True, "provider": "Cache"}
 
-    # CRITICAL FIX: No mlflow.start_run() here. The endpoint just queues the request.
     loop, fut, ctx = asyncio.get_running_loop(), asyncio.get_running_loop().create_future(), contextvars.copy_context()
     await request_queue.put((fut, req, q_hash, ctx, time.time()))
     
