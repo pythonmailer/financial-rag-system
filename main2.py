@@ -8,6 +8,7 @@ import asyncio
 import contextvars
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Depends
 from mlflow.entities import SpanType
@@ -281,8 +282,11 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 # ✅ CACHE WRITE
                 cache_entry = CacheEntry(
                     query_hash=q_hash,
+                    user_query=req.query,
                     llm_response=answer,
-                    created_at=int(time.time()),
+                    created_at=datetime.now(timezone.utc),
+                    ticker=req.ticker,
+                    provider=provider,
                 )
                 db.add(cache_entry)
                 db.commit()
