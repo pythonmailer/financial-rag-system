@@ -66,9 +66,9 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       HF_TOKEN: ${HF_TOKEN}
       # Aligned with hardcoded AWS IP logic
-      DATABASE_URL: postgresql://admin:adminpassword@13.232.197.229:5432/financial_rag
-      QDRANT_URL: http://13.232.197.229:6333
-      MLFLOW_TRACKING_URI: http://13.232.197.229:5001
+      DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
+      QDRANT_URL: http://qdrant:6333
+      MLFLOW_TRACKING_URI: http://mlflow:5001
       MLFLOW_EXPERIMENT_NAME: "Apple_Financial_RAG"
       TESTING: "False"
       PYTHONPATH: /app
@@ -94,7 +94,7 @@ services:
       - "8501:8501"
     environment:
       # Pointing directly to the Public IP for consistent routing
-      BACKEND_URL: http://13.232.197.229:8001
+      BACKEND_URL: http://backend:8001
       PYTHONPATH: /app
     depends_on:
       backend:
@@ -108,9 +108,9 @@ services:
     volumes:
       - ./sec_data:/app/sec_data
     environment:
-      QDRANT_URL: http://13.232.197.229:6333
-      BACKEND_URL: http://13.232.197.229:8001
-      DATABASE_URL: postgresql://admin:adminpassword@13.232.197.229:5432/financial_rag
+      QDRANT_URL: http://qdrant:6333
+      BACKEND_URL: http://backend:8001
+      DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
       PYTHONPATH: /app
     depends_on:
       backend:
