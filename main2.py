@@ -1,4 +1,4 @@
-# main2.py -- updated MLflow-safe version for async workers
+# main2.py -- Production RAG with Async-Safe MLflow Tracing
 
 import os
 import time
@@ -60,21 +60,20 @@ if not TESTING:
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
 
-    trace = mlflow.trace
+    # Aliased for cleaner internal function calls
     start_span = mlflow.start_span
 else:
     import contextlib
     SentenceTransformer = CrossEncoder = models = AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f)
     wait_exponential = stop_after_attempt = None
-    trace = lambda name=None, **kwargs: (lambda f: f)
 
     @contextlib.contextmanager
     def start_span(*args, **kwargs):
         yield None
 
 # ==========================================
-# LAZY LOADERS
+# LAZY LOADERS (Optimized for AWS RAM)
 # ==========================================
 @lru_cache()
 def get_embedder():
@@ -121,9 +120,6 @@ class CircuitBreaker:
     def trip(self, cooldown=60):
         self._write_state({"healthy": False, "disabled_until": time.time() + cooldown})
 
-    def set_healthy(self, healthy=True):
-        self._write_state({"healthy": healthy, "disabled_until": 0})
-
 groq_breaker = CircuitBreaker("groq")
 
 # ==========================================
@@ -149,7 +145,7 @@ class QueryRequest(BaseModel):
     query: str; ticker: str; document_type: str | None = None; top_k: int = 5
 
 # ==========================================
-# CORE LOGIC (same as you had)
+# CORE LOGIC
 # ==========================================
 def route_query(query: str) -> str:
     complex_keywords = ["compare", "analyze", "why", "impact", "trends", "growth", "risk"]
@@ -191,22 +187,17 @@ if not TESTING:
         return await asyncio.wait_for(client.chat.completions.create(model=model_name, messages=messages, temperature=0.2), timeout=12)
 
 # ==========================================
-# GLOBALS FOR MLflow (populated at lifespan)
+# GLOBALS FOR MLflow
 # ==========================================
 MLFLOW_EXPERIMENT_ID = None
 MLFLOW_CLIENT = None
 
 # ==========================================
-# PROCESS PIPELINE (modified to accept run_id)
+# PROCESS PIPELINE
 # ==========================================
 async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time, run_id=None):
-    """
-    NOTE: run_id is the Mlflow run id created in the ask endpoint and passed into the queue.
-    We use MlflowClient.log_metric/log_param with explicit run_id so logging works across async tasks.
-    """
-    client = None
-    if not TESTING:
-        client = MLFLOW_CLIENT  # MlflowClient instance created at lifespan
+    client = MLFLOW_CLIENT
+    # Parent span for the specific request lifecycle
     with start_span(name=f"RAG-Workflow-{req.ticker}") as root_span:
         async with llm_semaphore:
             try:
@@ -248,80 +239,48 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 if root_span:
                     root_span.set_outputs({"final_answer": answer, "provider": provider})
 
-                # --- LOG METRICS TO MLflow USING MlflowClient (explicit run_id) ---
+                # --- MLflow CHRONOLOGICAL METRICS LOGGING ---
                 if not TESTING and client and run_id:
                     try:
                         ts_ms = int(time.time() * 1000)
-                        # log a few metrics
-                        client.log_metric(run_id, "qdrant_ms", float(q_latency or 0.0), ts_ms, 0)
-                        client.log_metric(run_id, "rerank_ms", float(rerank_ms or 0.0), ts_ms, 0)
-                        client.log_metric(run_id, "total_e2e_ms", float((time.time() - req_arrival_time) * 1000), ts_ms, 0)
-                        # add some params
-                        client.log_param(run_id, "ticker", req.ticker)
-                        client.log_param(run_id, "provider", provider)
-                    except Exception as e:
-                        # Keep worker robust if mlflow temporarily fails
-                        print("⚠️ MLflow log error:", e)
+                        client.log_metric(run_id, "qdrant_ms", float(q_latency), ts_ms)
+                        client.log_metric(run_id, "rerank_ms", float(rerank_ms), ts_ms)
+                        client.log_metric(run_id, "total_e2e_ms", float((time.time() - req_arrival_time) * 1000), ts_ms)
+                    except Exception as e: print("⚠️ MLflow log error:", e)
 
-                # --- PERSIST CACHE TO DB (if desired) ---
+                # --- PERSIST CACHE ---
                 try:
                     db = SessionLocal()
-                    cache_entry = CacheEntry(
-                        query_hash=q_hash,
-                        user_query=req.query,
-                        llm_response=answer,
-                        created_at=datetime.now(timezone.utc),
-                        ticker=req.ticker,
-                        provider=provider,
-                    )
-                    db.add(cache_entry)
-                    db.commit()
-                    db.close()
-                except Exception as e:
-                    print("⚠️ Cache DB write failed:", e)
+                    db.add(CacheEntry(query_hash=q_hash, user_query=req.query, llm_response=answer, ticker=req.ticker, provider=provider))
+                    db.commit(); db.close()
+                except: pass
 
                 fut.set_result({"query_hash": q_hash, "query": req.query, "answer": answer, "sources": sources, "cached": False, "provider": provider})
             
             except Exception as e:
-                if root_span:
-                    root_span.set_attribute("error", True)
-                    root_span.set_attribute("error_msg", str(e))
-                # If MLflow run exists, mark it failed
-                if not TESTING and MLFLOW_CLIENT and run_id:
-                    try:
-                        MLFLOW_CLIENT.set_terminated(run_id, status="FAILED")
-                    except Exception:
-                        pass
+                if root_span: root_span.set_attribute("error", str(e))
+                if not TESTING and client and run_id: client.set_terminated(run_id, status="FAILED")
                 fut.set_exception(e)
             else:
-                # mark run finished
-                if not TESTING and MLFLOW_CLIENT and run_id:
-                    try:
-                        MLFLOW_CLIENT.set_terminated(run_id, status="FINISHED")
-                    except Exception as e:
-                        print("⚠️ MLflow finalize error:", e)
+                if not TESTING and client and run_id: client.set_terminated(run_id, status="FINISHED")
 
 # ==========================================
-# BATCH ENGINE (unchanged other than tuple carrying run_id)
+# BATCH ENGINE
 # ==========================================
 async def batch_processor():
     while True:
         batch = []
-        # enqueue items are tuples: (fut, req, q_hash, ctx, req_arrival_time, run_id)
         fut, req, q_hash, ctx, req_arrival_time, run_id = await request_queue.get()
         batch.append((fut, req, q_hash, ctx, req_arrival_time, run_id))
         await asyncio.sleep(0.05)
         while not request_queue.empty() and len(batch) < MAX_BATCH_SIZE:
-            # grab more if available
-            item = request_queue.get_nowait()
-            batch.append(item)
+            batch.append(request_queue.get_nowait())
 
         queries = [item[1].query for item in batch]
         with start_span(name="Batch_Embedding", span_type=SpanType.TOOL) as span:
             vectors = await asyncio.to_thread(embed_query_batch, queries)
 
         for i, (fut, req, q_hash, ctx, req_arrival_time, run_id) in enumerate(batch):
-            # schedule worker in the captured context
             ctx.run(asyncio.create_task, process_independently(i, fut, req, q_hash, vectors, req_arrival_time, run_id))
 
 # ==========================================
@@ -334,31 +293,12 @@ async def lifespan(app: FastAPI):
     if not TESTING:
         try:
             mlflow.set_tracking_uri(MLFLOW_URI)
-            # ensure experiment exists and use its ID
-            client = MlflowClient(tracking_uri=MLFLOW_URI)
-            MLFLOW_CLIENT = client
-
-            exp = client.get_experiment_by_name("Financial-RAG")
-            if exp is None:
-                MLFLOW_EXPERIMENT_ID = client.create_experiment("Financial-RAG")
-            else:
-                MLFLOW_EXPERIMENT_ID = exp.experiment_id
-
-            # optional: autolog hooks
-            try:
-                mlflow.openai.autolog(log_traces=True)
-            except Exception:
-                # ignore if not available
-                pass
-
-            print(f"🚀 MLflow Connected to: {MLFLOW_URI} (experiment_id={MLFLOW_EXPERIMENT_ID})")
-
-        except Exception as e:
-            print(f"⚠️ MLflow Connection Failed: {e}")
-            MLFLOW_CLIENT = None
-            MLFLOW_EXPERIMENT_ID = None
-
-    # start batch worker
+            MLFLOW_CLIENT = MlflowClient(tracking_uri=MLFLOW_URI)
+            exp = MLFLOW_CLIENT.get_experiment_by_name("Financial-RAG")
+            MLFLOW_EXPERIMENT_ID = exp.experiment_id if exp else MLFLOW_CLIENT.create_experiment("Financial-RAG")
+            mlflow.openai.autolog(log_traces=True)
+            print(f"🚀 MLflow Connected to: {MLFLOW_URI}")
+        except Exception as e: print(f"⚠️ MLflow Offline: {e}")
     task = asyncio.create_task(batch_processor())
     yield
     task.cancel()
@@ -368,45 +308,28 @@ app.router.lifespan_context = lifespan
 @app.post("/ask")
 async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     q_hash = hashlib.sha256(f"{req.ticker}_{req.query.lower()}".encode()).hexdigest()
-    cached = (
-        db.query(CacheEntry)
-        .filter(CacheEntry.query_hash == q_hash, CacheEntry.ticker == req.ticker)
-        .first()
-    )
-    if cached:
-        return {"query_hash": q_hash, "answer": cached.llm_response, "sources": [], "cached": True, "provider": cached.provider or "Cache"}
+    cached = db.query(CacheEntry).filter(CacheEntry.query_hash == q_hash, CacheEntry.ticker == req.ticker).first()
+    if cached: return {"answer": cached.llm_response, "cached": True, "provider": "Cache"}
 
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    ctx = contextvars.copy_context()
-
-    # Create MLflow run **explicitly** via MlflowClient so we can pass run_id across tasks
+    # Initialize MLflow Run explicitly
     run_id = None
-    if not TESTING and MLFLOW_CLIENT and MLFLOW_EXPERIMENT_ID:
+    if not TESTING and MLFLOW_CLIENT:
         try:
             run = MLFLOW_CLIENT.create_run(experiment_id=MLFLOW_EXPERIMENT_ID, run_name=f"Request-{req.ticker}")
             run_id = run.info.run_id
-            # optional: initial tags/params
             MLFLOW_CLIENT.log_param(run_id, "ticker", req.ticker)
-            MLFLOW_CLIENT.log_param(run_id, "query_hash", q_hash)
-        except Exception as e:
-            print("⚠️ MLflow create_run failed:", e)
-            run_id = None
+        except: pass
 
-    # enqueue for processing; now includes run_id
+    loop, fut, ctx = asyncio.get_running_loop(), asyncio.get_running_loop().create_future(), contextvars.copy_context()
     await request_queue.put((fut, req, q_hash, ctx, time.time(), run_id))
-
-    # do not use mlflow.start_run here (it won't propagate to worker tasks). Return future result.
     return await asyncio.wait_for(fut, timeout=90)
 
 @app.get("/ready")
 def ready():
     try:
-        # Check Qdrant Connection
         get_qdrant().get_collections()
         return {"status": "ready"}
-    except Exception as e:
-        return {"status": "not_ready", "error": str(e)}
+    except: return {"status": "not_ready"}
 
 @app.post("/embed")
 async def embed(req: EmbedRequest):
