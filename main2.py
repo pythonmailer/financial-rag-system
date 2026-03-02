@@ -1,30 +1,35 @@
-# main2.py -- Production RAG with MLflow (Old Working Style Restored - FIXED)
+# main2.py -- Production RAG with Async-Safe MLflow Tracing
 
 import os
 import time
+import json
+import tempfile
 import hashlib
 import numpy as np
 import asyncio
 import contextvars
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from mlflow.entities import SpanType
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
+# Load local .env if it exists
 load_dotenv()
 
 # ==========================================
-# 🌐 INFRA CONFIG
+# 🌐 HARDCODED INFRASTRUCTURE CONFIG
 # ==========================================
 AWS_IP = "13.232.197.229"
 QDRANT_URL = os.getenv("QDRANT_URL", f"http://{AWS_IP}:6333")
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"http://{AWS_IP}:5001")
+DB_URL = os.getenv("DATABASE_URL", f"postgresql://admin:adminpassword@{AWS_IP}:5432/financial_rag")
 
-from database import SessionLocal, CacheEntry
+from database import SessionLocal, CacheEntry, FeedbackEntry
 
 # ==========================================
 # CONFIG
@@ -41,9 +46,6 @@ llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 class EmbedRequest(BaseModel):
     texts: list[str]
 
-# ==========================================
-# MLflow & HEAVY IMPORTS
-# ==========================================
 # ==========================================
 # CONDITIONAL IMPORTS & TRACING
 # ==========================================
@@ -66,8 +68,8 @@ else:
     SentenceTransformer = CrossEncoder = models = AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f)
     wait_exponential = stop_after_attempt = None
-    
-    # Mock trace decorator for testing
+
+    # Dummy trace decorator for testing
     trace = lambda name=None, **kwargs: (lambda f: f)
 
     @contextlib.contextmanager
@@ -75,39 +77,60 @@ else:
         yield None
 
 # ==========================================
-# LAZY LOADERS
+# LAZY LOADERS (Optimized for AWS RAM)
 # ==========================================
 @lru_cache()
 def get_embedder():
-    if TESTING:
-        return None
+    if TESTING: return None
     device = "cpu"
     if USE_GPU:
         import torch
-        if torch.cuda.is_available():
-            device = "cuda"
+        if torch.backends.mps.is_available(): device = "mps"
+        elif torch.cuda.is_available(): device = "cuda"
     return SentenceTransformer("BAAI/bge-small-en-v1.5", device=device)
 
 @lru_cache()
 def get_reranker():
-    if TESTING:
-        return None
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
+    if TESTING: return None
+    import torch
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
 
 @lru_cache()
 def get_qdrant():
-    if TESTING:
-        return None
+    if TESTING: return None
     return QdrantClient(url=QDRANT_URL)
 
 # ==========================================
-# LLM CLIENT
+# CIRCUIT BREAKERS
+# ==========================================
+class CircuitBreaker:
+    def __init__(self, service_name="groq"):
+        self.file_path = os.path.join(tempfile.gettempdir(), f"{service_name}_cb_state.json")
+
+    def _write_state(self, state):
+        try:
+            with open(self.file_path, "w") as f: json.dump(state, f)
+        except: pass
+
+    @property
+    def is_healthy(self):
+        if not os.path.exists(self.file_path): return True
+        try:
+            with open(self.file_path) as f: state = json.load(f)
+            return state.get("healthy", True) or time.time() > state.get("disabled_until", 0)
+        except: return True
+
+    def trip(self, cooldown=60):
+        self._write_state({"healthy": False, "disabled_until": time.time() + cooldown})
+
+groq_breaker = CircuitBreaker("groq")
+
+# ==========================================
+# LLM CLIENTS
 # ==========================================
 if not TESTING:
-    primary_client = AsyncOpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        api_key=os.getenv("GROQ_API_KEY"),
-    )
+    primary_client = AsyncOpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.getenv("GROQ_API_KEY"))
 else:
     primary_client = None
 
@@ -115,21 +138,15 @@ else:
 # APP INIT
 # ==========================================
 app = FastAPI(title="Financial RAG API")
-if not TESTING:
-    FastAPIInstrumentor.instrument_app(app)
+if not TESTING: FastAPIInstrumentor.instrument_app(app)
 
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
 class QueryRequest(BaseModel):
-    query: str
-    ticker: str
-    document_type: str | None = None
-    top_k: int = 5
+    query: str; ticker: str; document_type: str | None = None; top_k: int = 5
 
 # ==========================================
 # CORE LOGIC
@@ -140,14 +157,8 @@ def route_query(query: str) -> str:
 
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     must = [models.FieldCondition(key="ticker", match=models.MatchValue(value=ticker.upper()))]
-    if document_type:
-        must.append(models.FieldCondition(key="document_type", match=models.MatchValue(value=document_type.upper())))
-    return get_qdrant().query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=limit,
-        query_filter=models.Filter(must=must),
-    )
+    if document_type: must.append(models.FieldCondition(key="document_type", match=models.MatchValue(value=document_type.upper())))
+    return get_qdrant().query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=limit, query_filter=models.Filter(must=must))
 
 def rerank_documents(query, texts, top_k):
     scores = get_reranker().predict([[query, t] for t in texts])
@@ -159,51 +170,47 @@ def embed_query_batch(queries):
 
 async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
     with start_span(name="LLM_Generation", span_type=SpanType.LLM) as span:
-        if TESTING:
-            return "Mock answer.", "Mock"
+        if TESTING: return "Mock answer.", "Mock"
+        msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
+        groq_model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
 
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query},
-        ]
-
-        model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
-
-        res = await safe_llm_call(primary_client, model, msgs)
-        ans = res.choices[0].message.content
-
-        if span:
-            span.set_attribute("llm_model", model)
-            span.set_outputs({"llm_answer": ans})
-
-        return ans, f"Groq ({model})"
+        if groq_breaker.is_healthy:
+            try:
+                res = await safe_llm_call(primary_client, groq_model, msgs)
+                ans = res.choices[0].message.content
+                if span:
+                    span.set_attribute("llm_model", groq_model)
+                    span.set_outputs({"llm_answer": ans})
+                return ans, f"Groq ({groq_model})"
+            except: groq_breaker.trip()
+        return "⚠️ LLM Service Degraded.", "System Offline"
 
 if not TESTING:
     @retry(wait=wait_exponential(min=2, max=6), stop=stop_after_attempt(3))
     async def safe_llm_call(client, model_name, messages):
-        return await asyncio.wait_for(
-            client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=0.2,
-            ),
-            timeout=12,
-        )
+        return await asyncio.wait_for(client.chat.completions.create(model=model_name, messages=messages, temperature=0.2), timeout=12)
 
 # ==========================================
-# PROCESS (Exact Old Working Style)
+# GLOBALS FOR MLflow
 # ==========================================
+MLFLOW_EXPERIMENT_ID = None
+MLFLOW_CLIENT = None
+
 # ==========================================
 # PROCESS PIPELINE
 # ==========================================
 @trace(name="RAG_Workflow")
-async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time, run_id=None):
+async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time):
+    # Retrieve the global client
+    global MLFLOW_CLIENT
     client = MLFLOW_CLIENT
-    
+
     # Grab the automatically created root span to add global inputs/outputs
-    root_span = mlflow.get_current_active_span()
-    if root_span:
-        root_span.set_inputs({"user_query": req.query, "ticker": req.ticker})
+    root_span = None
+    if not TESTING:
+        root_span = mlflow.get_current_active_span()
+        if root_span:
+            root_span.set_inputs({"user_query": req.query, "ticker": req.ticker})
 
     async with llm_semaphore:
         try:
@@ -213,9 +220,8 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 span.set_outputs({"routing_result": complexity})
 
             # --- STEP 2: RETRIEVAL ---
-            # Explicitly setting the attribute ensures the UI recognizes the "RETRIEVER" type
             with start_span(name="2_Vector_Retrieval", span_type=SpanType.RETRIEVER) as span:
-                span.set_attribute("span_type", "RETRIEVER") # 👈 Fixes the UI missing tab error
+                span.set_attribute("span_type", "RETRIEVER")
                 t_start = time.time()
                 search = await asyncio.to_thread(retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type)
                 q_latency = (time.time() - t_start) * 1000
@@ -245,8 +251,10 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 root_span.set_outputs({"final_answer": answer, "provider": provider})
 
             # --- MLflow CHRONOLOGICAL METRICS LOGGING ---
-            if not TESTING and client and run_id:
+            if not TESTING and root_span and client:
                 try:
+                    # MLflow traces automatically tie request_id to the Run ID
+                    run_id = root_span.request_id 
                     ts_ms = int(time.time() * 1000)
                     client.log_metric(run_id, "qdrant_ms", float(q_latency), ts_ms)
                     client.log_metric(run_id, "rerank_ms", float(rerank_ms), ts_ms)
@@ -264,10 +272,7 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
         
         except Exception as e:
             if root_span: root_span.set_attribute("error", str(e))
-            if not TESTING and client and run_id: client.set_terminated(run_id, status="FAILED")
             fut.set_exception(e)
-        else:
-            if not TESTING and client and run_id: client.set_terminated(run_id, status="FINISHED")
 
 # ==========================================
 # BATCH ENGINE
@@ -275,75 +280,52 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
 async def batch_processor():
     while True:
         batch = []
+        # Notice we no longer pull run_id from the queue, @trace handles it
         fut, req, q_hash, ctx, req_arrival_time = await request_queue.get()
         batch.append((fut, req, q_hash, ctx, req_arrival_time))
-
         await asyncio.sleep(0.05)
-
         while not request_queue.empty() and len(batch) < MAX_BATCH_SIZE:
             batch.append(request_queue.get_nowait())
 
         queries = [item[1].query for item in batch]
-
-        with start_span(name="Batch_Embedding", span_type=SpanType.TOOL):
+        with start_span(name="Batch_Embedding", span_type=SpanType.TOOL) as span:
             vectors = await asyncio.to_thread(embed_query_batch, queries)
 
         for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
-            ctx.run(
-                asyncio.create_task,
-                process_independently(i, fut, req, q_hash, vectors, req_arrival_time),
-            )
+            ctx.run(asyncio.create_task, process_independently(i, fut, req, q_hash, vectors, req_arrival_time))
 
 # ==========================================
-# LIFESPAN
+# LIFESPAN & ENDPOINTS
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global request_queue
+    global request_queue, MLFLOW_CLIENT, MLFLOW_EXPERIMENT_ID
     request_queue = asyncio.Queue()
-
     if not TESTING:
         try:
             mlflow.set_tracking_uri(MLFLOW_URI)
-            mlflow.set_experiment("Financial-RAG")
+            MLFLOW_CLIENT = MlflowClient(tracking_uri=MLFLOW_URI)
+            exp = MLFLOW_CLIENT.get_experiment_by_name("Financial-RAG")
+            MLFLOW_EXPERIMENT_ID = exp.experiment_id if exp else MLFLOW_CLIENT.create_experiment("Financial-RAG")
             mlflow.openai.autolog(log_traces=True)
-            print(f"✅ MLflow connected: {MLFLOW_URI}")
-        except Exception as e:
-            print("⚠️ MLflow Offline:", e)
-
+            print(f"🚀 MLflow Connected to: {MLFLOW_URI}")
+        except Exception as e: print(f"⚠️ MLflow Offline: {e}")
     task = asyncio.create_task(batch_processor())
     yield
     task.cancel()
 
 app.router.lifespan_context = lifespan
 
-# ==========================================
-# ENDPOINTS
-# ==========================================
 @app.post("/ask")
 async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     q_hash = hashlib.sha256(f"{req.ticker}_{req.query.lower()}".encode()).hexdigest()
+    cached = db.query(CacheEntry).filter(CacheEntry.query_hash == q_hash, CacheEntry.ticker == req.ticker).first()
+    if cached: return {"answer": cached.llm_response, "cached": True, "provider": "Cache"}
 
-    cached = db.query(CacheEntry).filter(CacheEntry.query_hash == q_hash).first()
-    if cached:
-        return {
-            "query_hash": q_hash,
-            "answer": cached.llm_response,
-            "sources": [],
-            "cached": True,
-            "provider": "Cache",
-        }
-
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    ctx = contextvars.copy_context()
-
+    # CRITICAL FIX: No mlflow.start_run() here. The endpoint just queues the request.
+    loop, fut, ctx = asyncio.get_running_loop(), asyncio.get_running_loop().create_future(), contextvars.copy_context()
     await request_queue.put((fut, req, q_hash, ctx, time.time()))
-
-    if not TESTING:
-        with mlflow.start_run(run_name=f"Request-{req.ticker}"):
-            return await asyncio.wait_for(fut, timeout=90)
-
+    
     return await asyncio.wait_for(fut, timeout=90)
 
 @app.get("/ready")
@@ -351,8 +333,7 @@ def ready():
     try:
         get_qdrant().get_collections()
         return {"status": "ready"}
-    except:
-        return {"status": "not_ready"}
+    except: return {"status": "not_ready"}
 
 @app.post("/embed")
 async def embed(req: EmbedRequest):
