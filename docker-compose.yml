@@ -82,8 +82,8 @@ services:
       test: ["CMD-SHELL", "curl -f http://localhost:8001/ready || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 90s
+      retries: 5           # 👈 Increased from 3
+      start_period: 180s
     restart: unless-stopped
 
   frontend:
