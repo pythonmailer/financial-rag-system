@@ -44,9 +44,13 @@ class EmbedRequest(BaseModel):
 # ==========================================
 # MLflow & HEAVY IMPORTS
 # ==========================================
+# ==========================================
+# CONDITIONAL IMPORTS & TRACING
+# ==========================================
 if not TESTING:
     import mlflow
     import mlflow.openai
+    from mlflow.tracking import MlflowClient
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from sentence_transformers import SentenceTransformer, CrossEncoder
     from qdrant_client import QdrantClient
@@ -54,12 +58,17 @@ if not TESTING:
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
 
+    # Aliased for cleaner internal function calls
+    trace = mlflow.trace
     start_span = mlflow.start_span
 else:
     import contextlib
     SentenceTransformer = CrossEncoder = models = AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f)
     wait_exponential = stop_after_attempt = None
+    
+    # Mock trace decorator for testing
+    trace = lambda name=None, **kwargs: (lambda f: f)
 
     @contextlib.contextmanager
     def start_span(*args, **kwargs):
