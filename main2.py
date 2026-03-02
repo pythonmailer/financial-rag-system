@@ -24,15 +24,15 @@ COLLECTION_NAME = "financial_documents"
 
 request_queue = None
 MAX_BATCH_SIZE = 32
-# FIX 1: Lowered to prevent Groq API bans during concurrent load testing
 MAX_CONCURRENT_LLM_CALLS = 10 
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
 # ==========================================
-# 🧪 TESTING FAST PATH (no heavy imports)
+# 🧪 CONDITIONAL IMPORTS & TRACING SETUP
 # ==========================================
 if not TESTING:
     import mlflow
+    import mlflow.openai
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from sentence_transformers import SentenceTransformer, CrossEncoder
     from qdrant_client import QdrantClient
@@ -40,6 +40,8 @@ if not TESTING:
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
 
+    # Map the real decorator
+    trace = mlflow.trace
 else:
     SentenceTransformer = None
     CrossEncoder = None
@@ -49,6 +51,9 @@ else:
     retry = lambda *a, **k: (lambda f: f)
     wait_exponential = None
     stop_after_attempt = None
+
+    # Dummy decorator for testing environments
+    trace = lambda name=None, **kwargs: (lambda f: f)
 
 # ==========================================
 # LAZY MODELS (production only)
@@ -109,7 +114,6 @@ else:
 app = FastAPI(title="Financial RAG API - Stream-Batched")
 
 if not TESTING:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     FastAPIInstrumentor.instrument_app(app)
 
 # ==========================================
@@ -213,8 +217,9 @@ gemini_breaker = CircuitBreaker("gemini")
 openrouter_breaker = CircuitBreaker("openrouter")
 
 # ==========================================
-# RETRIEVAL
+# RETRIEVAL (Now Traced)
 # ==========================================
+@trace(name="Qdrant_Vector_Search")
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if TESTING:
         return type("obj", (object,), {"points": []})
@@ -248,8 +253,9 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
         return type("obj", (object,), {"points": []})
 
 # ==========================================
-# RERANK
+# RERANK (Now Traced)
 # ==========================================
+@trace(name="CrossEncoder_Rerank")
 def rerank_documents(query, texts, top_k):
     if TESTING or not texts:
         idx = list(range(min(top_k, len(texts))))
@@ -262,8 +268,9 @@ def rerank_documents(query, texts, top_k):
     return idx, scores
 
 # ==========================================
-# EMBED BATCH
+# EMBED BATCH (Now Traced)
 # ==========================================
+@trace(name="Batch_Embed_Queries")
 def embed_query_batch(queries):
     if TESTING:
         return [[0.0] * 384 for _ in queries]
@@ -346,9 +353,9 @@ async def generate_answer(system_prompt, user_query):
     return "⚠️ All providers unavailable.", "System Degraded"
 
 # ==========================================
-# BATCH ENGINE
+# BATCH ENGINE (Main Trace Entrypoint)
 # ==========================================
-# FIX 2: Added q_hash as a parameter to avoid calculating it twice
+@trace(name="Full_RAG_Pipeline")
 async def process_independently(i, fut, req, q_hash, batch_vectors):
     async with llm_semaphore:
         try:
@@ -403,7 +410,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors):
 async def batch_processor():
     while True:
         batch = []
-        # FIX 3: Unpack q_hash from the queue
         fut, req, q_hash = await request_queue.get()
         batch.append((fut, req, q_hash))
 
@@ -415,7 +421,6 @@ async def batch_processor():
         queries = [item[1].query for item in batch]
         vectors = await asyncio.to_thread(embed_query_batch, queries)
 
-        # FIX 4: Pass q_hash to the independent processor
         for i, (fut, req, q_hash) in enumerate(batch):
             asyncio.create_task(process_independently(i, fut, req, q_hash, vectors))
 
@@ -431,7 +436,6 @@ async def lifespan(app: FastAPI):
         try:
             mlflow.set_tracking_uri("http://mlflow:5001")
             mlflow.set_experiment("Financial-RAG")
-            # FIX 5: Ensure log_traces=True is here to fix the empty async completions
             mlflow.openai.autolog(log_traces=True)
             print("✅ MLflow initialized successfully.")
         except Exception as e:
@@ -480,7 +484,6 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
 
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
-    # FIX 6: Add q_hash to the tuple so we don't recalculate it later
     await request_queue.put((fut, req, q_hash))
 
     try:

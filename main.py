@@ -25,7 +25,7 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 COLLECTION_NAME = "financial_documents"
 
 # ==========================================
-# CONDITIONAL IMPORTS (Skip heavy deps in CI)
+# CONDITIONAL IMPORTS & TRACING SETUP
 # ==========================================
 if not TESTING:
     import mlflow
@@ -36,6 +36,9 @@ if not TESTING:
     from qdrant_client.http import models
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
+    
+    # Map the real decorator
+    trace = mlflow.trace
 else:
     SentenceTransformer = None
     CrossEncoder = None
@@ -43,6 +46,9 @@ else:
     models = None
     AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f) # Mock retry for testing
+    
+    # Dummy decorator for testing environments
+    trace = lambda name=None, **kwargs: (lambda f: f)
 
 # ==========================================
 # LIFESPAN & APP INIT
@@ -191,12 +197,14 @@ if not TESTING:
     )
 
 # ==========================================
-# RAG CORE LOGIC
+# RAG CORE LOGIC (Now Traced)
 # ==========================================
+@trace(name="Embed_Query")
 def embed_query(query: str):
     if TESTING: return [0.0] * 384
     return get_embedder().encode(query).tolist()
 
+@trace(name="Qdrant_Vector_Search")
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if TESTING: return type("obj", (object,), {"points": []})
     
@@ -228,6 +236,7 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     except Exception:
         return type("obj", (object,), {"points": []})
 
+@trace(name="CrossEncoder_Rerank")
 def rerank_documents(query, texts, top_k):
     if TESTING or not texts:
         return list(range(min(top_k, len(texts)))), np.zeros(len(texts))
@@ -304,9 +313,10 @@ def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 # ==========================================
-# ASK (SEQUENTIAL BASELINE)
+# ASK (SEQUENTIAL BASELINE) - Root Trace
 # ==========================================
 @app.post("/ask")
+@trace(name="Sequential_RAG_Pipeline")
 async def ask(req: QueryRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     q_hash = hashlib.sha256(
         f"{req.ticker}_{req.query.lower()}".encode()
