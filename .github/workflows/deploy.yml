@@ -44,12 +44,14 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
-          envs: GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY
+          # Note: Exporting variables for use in the remote script
+          envs: GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY,HF_TOKEN
           script: |
             set -e
             echo "🚀 Starting Deployment Flow..."
@@ -62,7 +64,7 @@ jobs:
               sudo usermod -aG docker ubuntu
             fi
 
-            # 2. Navigate to Project Directory
+            # 2. & 3. Smart Git Setup: Clone or Repair Metadata
             if [ -d "$HOME/financial-rag-system" ]; then
               if [ ! -d "$HOME/financial-rag-system/.git" ]; then
                 echo "⚠️ Directory exists but is NOT a git repo. Cleaning up..."
@@ -75,40 +77,39 @@ jobs:
             fi
 
             cd ~/financial-rag-system
-            echo "📥 Syncing code with Main..."
+            echo "📥 Syncing latest code from Main..."
             git fetch origin main
             git reset --hard origin/main
 
-            # 4. Generate Production .env
-            # We use service names (mlflow, postgres) because containers share a network
+            # 4. Generate Production .env (Fixed with HF_TOKEN)
             echo "📝 Updating .env file..."
-            printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nDATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag\nMLFLOW_TRACKING_URI=http://mlflow:5001\nQDRANT_URL=http://qdrant:6333\nTESTING=False\nUSE_GPU=False\n" \
-            "$GROQ_API_KEY" "$GEMINI_API_KEY" "$OPENROUTER_API_KEY" > .env
+            printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nHF_TOKEN=%s\nDATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag\nMLFLOW_TRACKING_URI=http://mlflow:5001\nQDRANT_URL=http://qdrant:6333\nTESTING=False\nUSE_GPU=False\n" \
+            "$GROQ_API_KEY" "$GEMINI_API_KEY" "$OPENROUTER_API_KEY" "$HF_TOKEN" > .env
 
-            # 5. The Update Strategy
+            # 5. Build and Deploy Strategy
             echo "🧹 Stopping services and pruning old builds..."
             sudo docker compose down
-            
-            # This is the "Secret Sauce" - it rebuilds your code but doesn't 
-            # re-download postgres/qdrant if they haven't changed.
-            echo "🏗️ Rebuilding and Launching Containers..."
+            # Optional: Clear unused images to save disk space on EC2
+            sudo docker image prune -f
+
+            echo "🏗️ Rebuilding and Launching All Containers..."
             sudo docker compose up -d --build
 
-            # 6. Database Migrations (Optional but Recommended)
-            echo "📦 Running DB Migrations..."
-            sudo docker compose run --rm backend alembic upgrade head || echo "Alembic skipped"
+            # 6. Run Database Migrations
+            echo "📦 Checking migrations..."
+            sudo docker compose run --rm backend alembic upgrade head || echo "⚠️ Alembic migration skipped or failed."
 
             # 7. Post-Deployment Health Check
-            echo "⏳ Waiting for Backend to be Healthy..."
+            echo "⏳ Verifying Backend Status..."
             for i in {1..15}; do
               if curl -s http://localhost:8001/ready | grep -q '"ready"'; then
-                echo "✅ DEPLOYMENT SUCCESSFUL: New version is online."
+                echo "✅ DEPLOYMENT SUCCESSFUL: AlphaPredict is live!"
                 exit 0
               fi
-              echo "Waiting... ($i/15)"
+              echo "Backend still initializing models... ($i/15)"
               sleep 5
             done
 
-            echo "❌ ERROR: Backend failed to start after 75 seconds."
+            echo "❌ ERROR: Deployment timed out. Showing logs for debugging..."
             sudo docker compose logs backend
             exit 1
