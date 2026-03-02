@@ -29,7 +29,7 @@ MAX_CONCURRENT_LLM_CALLS = 10
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
 # ==========================================
-# 🧪 CONDITIONAL IMPORTS & TRACING SETUP
+# CONDITIONAL IMPORTS & TRACING
 # ==========================================
 if not TESTING:
     import mlflow
@@ -45,7 +45,7 @@ if not TESTING:
 else:
     SentenceTransformer = None
     CrossEncoder = None
-    QdrantClient = None
+    QDRANT_URL = None
     models = None
     AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f)
@@ -54,26 +54,23 @@ else:
     trace = lambda name=None, **kwargs: (lambda f: f)
 
 # ==========================================
-# LAZY MODELS
+# LAZY LOADERS
 # ==========================================
 @lru_cache()
 def get_embedder():
-    if TESTING:
-        return None
+    if TESTING: return None
     device = "cuda" if USE_GPU else "cpu"
     return SentenceTransformer("BAAI/bge-small-en-v1.5", device=device)
 
 @lru_cache()
 def get_reranker():
-    if TESTING:
-        return None
+    if TESTING: return None
     device = "cuda" if USE_GPU else "cpu"
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
 
 @lru_cache()
 def get_qdrant():
-    if TESTING:
-        return None
+    if TESTING: return None
     return QdrantClient(url=QDRANT_URL)
 
 # ==========================================
@@ -90,16 +87,13 @@ if not TESTING:
         AsyncOpenAI(
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=gemini_key,
-        )
-        if gemini_key
-        else None
+        ) if gemini_key else None
     )
 
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
     openrouter_client = (
         AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openrouter_key)
-        if openrouter_key
-        else None
+        if openrouter_key else None
     )
 else:
     primary_client = None
@@ -162,57 +156,14 @@ def queue_status():
     return {"queue_size": request_queue.qsize() if request_queue else 0}
 
 # ==========================================
-# EMBED ENDPOINT
+# EMBED
 # ==========================================
 @app.post("/embed")
 def embed(req: EmbedRequest):
     if TESTING:
         return {"embeddings": [[0.0] * 384 for _ in req.texts]}
-    embedder = get_embedder()
-    vectors = embedder.encode(req.texts)
+    vectors = get_embedder().encode(req.texts)
     return {"embeddings": vectors.tolist()}
-
-# ==========================================
-# CIRCUIT BREAKER
-# ==========================================
-class CircuitBreaker:
-    def __init__(self, service_name="groq"):
-        self.file_path = os.path.join(tempfile.gettempdir(), f"{service_name}_cb_state.json")
-
-    def _write_state(self, state):
-        tmp = self.file_path + ".tmp"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(state, f)
-            os.replace(tmp, self.file_path)
-        except:
-            pass
-
-    @property
-    def is_healthy(self):
-        if not os.path.exists(self.file_path):
-            return True
-        try:
-            with open(self.file_path) as f:
-                state = json.load(f)
-            if not state.get("healthy", True):
-                if time.time() > state.get("disabled_until", 0):
-                    self.set_healthy(True)
-                    return True
-                return False
-            return True
-        except:
-            return True
-
-    def trip(self, cooldown=60):
-        self._write_state({"healthy": False, "disabled_until": time.time() + cooldown})
-
-    def set_healthy(self, healthy=True):
-        self._write_state({"healthy": healthy, "disabled_until": 0})
-
-groq_breaker = CircuitBreaker("groq")
-gemini_breaker = CircuitBreaker("gemini")
-openrouter_breaker = CircuitBreaker("openrouter")
 
 # ==========================================
 # RETRIEVAL
@@ -222,16 +173,13 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if TESTING:
         return type("obj", (object,), {"points": []})
 
-    qdrant = get_qdrant()
-    if not qdrant:
-        return type("obj", (object,), {"points": []})
-
     must = [
         models.FieldCondition(
             key="ticker",
             match=models.MatchValue(value=ticker.upper()),
         )
     ]
+
     if document_type:
         must.append(
             models.FieldCondition(
@@ -241,7 +189,7 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
         )
 
     try:
-        return qdrant.query_points(
+        return get_qdrant().query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
             limit=limit,
@@ -260,8 +208,7 @@ def rerank_documents(query, texts, top_k):
         scores = np.zeros(len(texts))
         return idx, scores
 
-    reranker = get_reranker()
-    scores = reranker.predict([[query, t] for t in texts])
+    scores = get_reranker().predict([[query, t] for t in texts])
     idx = np.argsort(scores)[::-1][:top_k]
     return idx, scores
 
@@ -272,8 +219,7 @@ def rerank_documents(query, texts, top_k):
 def embed_query_batch(queries):
     if TESTING:
         return [[0.0] * 384 for _ in queries]
-    embedder = get_embedder()
-    return embedder.encode(queries).tolist()
+    return get_embedder().encode(queries).tolist()
 
 # ==========================================
 # CACHE SAVE
@@ -297,7 +243,7 @@ def save_to_cache(q_hash, user_query, llm_response, ticker, provider):
         db.close()
 
 # ==========================================
-# SAFE LLM CALL
+# LLM CALL
 # ==========================================
 if not TESTING:
     @retry(wait=wait_exponential(min=2, max=6), stop=stop_after_attempt(3))
@@ -351,10 +297,13 @@ async def generate_answer(system_prompt, user_query):
     return "⚠️ All providers unavailable.", "System Degraded"
 
 # ==========================================
-# PROCESS
+# PROCESS (WORKER)
 # ==========================================
 @trace(name="Full_RAG_Pipeline")
-async def process_independently(i, fut, req, q_hash, batch_vectors):
+async def process_independently(i, fut, req, q_hash, run_id, batch_vectors):
+    if not TESTING and run_id:
+        mlflow.start_run(run_id=run_id)
+
     async with llm_semaphore:
         try:
             search = await asyncio.to_thread(
@@ -417,8 +366,9 @@ async def process_independently(i, fut, req, q_hash, batch_vectors):
 async def batch_processor():
     while True:
         batch = []
-        fut, req, q_hash = await request_queue.get()
-        batch.append((fut, req, q_hash))
+
+        fut, req, q_hash, run_id = await request_queue.get()
+        batch.append((fut, req, q_hash, run_id))
 
         await asyncio.sleep(0.05)
 
@@ -430,10 +380,10 @@ async def batch_processor():
 
         ctx = contextvars.copy_context()
 
-        for i, (fut, req, q_hash) in enumerate(batch):
+        for i, (fut, req, q_hash, run_id) in enumerate(batch):
             ctx.run(
                 asyncio.create_task,
-                process_independently(i, fut, req, q_hash, vectors),
+                process_independently(i, fut, req, q_hash, run_id, vectors),
             )
 
 # ==========================================
@@ -495,7 +445,10 @@ async def _ask_impl(req: QueryRequest, db: Session):
 
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
-    await request_queue.put((fut, req, q_hash))
+
+    run_id = mlflow.active_run().info.run_id if (not TESTING and mlflow.active_run()) else None
+
+    await request_queue.put((fut, req, q_hash, run_id))
 
     try:
         return await asyncio.wait_for(fut, timeout=30)
@@ -503,12 +456,13 @@ async def _ask_impl(req: QueryRequest, db: Session):
         raise HTTPException(status_code=504, detail="Request timed out")
 
 # ==========================================
-# ASK ENDPOINT WITH ROOT TRACE
+# ASK ENDPOINT
 # ==========================================
 @app.post("/ask")
 async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     if not TESTING:
-        with mlflow.start_span(name="ASK_Request"):
-            return await _ask_impl(req, db)
+        with mlflow.start_run(run_name="rag_request", nested=True):
+            with mlflow.start_span(name="ASK_Request"):
+                return await _ask_impl(req, db)
     else:
         return await _ask_impl(req, db)
