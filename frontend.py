@@ -4,80 +4,101 @@ import os
 import time
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & THEMING
 # ==========================================
 st.set_page_config(
-    page_title="Financial RAG Assistant",
-    page_icon="📈",
-    layout="centered"
+    page_title="Apple Financial Intelligence",
+    page_icon="🍎",
+    layout="wide"
 )
 
+# Use fixed AAPL for the "Resume Edition"
+FIXED_TICKER = "AAPL"
 BACKEND_HOST = os.getenv("BACKEND_URL", "http://localhost:8001")
 ASK_URL = f"{BACKEND_HOST}/ask"
 FEEDBACK_URL = f"{BACKEND_HOST}/feedback"
 HEALTH_URL = f"{BACKEND_HOST}/ready"
 
-st.title("📈 Wall Street AI Analyst")
-st.caption("Advanced Financial RAG Engine powered by Groq & Gemini")
+# Custom CSS for a cleaner "Apple-esque" look
+st.markdown("""
+    <style>
+    .stApp { background-color: #ffffff; }
+    .stChatMessage { border-radius: 15px; }
+    .stButton>button { border-radius: 20px; }
+    </style>
+    """, unsafe_with_html=True)
 
 # ==========================================
-# 2. BACKEND STATUS CHECK
+# 2. SIDEBAR (System Metadata)
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ System Status")
-
+    st.title("🍎 Apple Intelligence")
+    st.caption("Specialized Financial RAG Engine")
+    
+    st.divider()
+    
+    # System Status Indicator
     try:
-        r = requests.get(HEALTH_URL, timeout=3)
-        if r.status_code == 200 and r.json().get("status") == "ready":
-            st.success("Backend: Ready")
+        r = requests.get(HEALTH_URL, timeout=2)
+        if r.status_code == 200:
+            st.success("● Core Engine: Online")
         else:
-            st.warning("Backend: Not Ready")
+            st.warning("● Core Engine: Initializing")
     except:
-        st.error("Backend: Offline")
+        st.error("● Core Engine: Offline")
 
-    ticker = st.text_input("Ticker", value="AAPL").upper()
-    top_k = st.slider("Top-K Chunks", 1, 10, 5)
+    st.markdown("### 🛠️ Model Settings")
+    top_k = st.slider("Retrieval Depth (Top-K)", 1, 10, 5, help="Number of SEC filing chunks retrieved per query.")
+    
+    st.info(f"**Target:** {FIXED_TICKER} (Apple Inc.)\n\n**Data:** FY2023-2024 10-K/Q Filings")
 
     st.divider()
-    if st.button("🧹 Clear Chat"):
+    
+    # Resume Highlight Section (Great for recruiters!)
+    with st.expander("🚀 Tech Highlights"):
+        st.write("- **Hybrid RAG:** Groq/Gemini LPU inference.")
+        st.write("- **Vector DB:** Qdrant with Metadata Filtering.")
+        st.write("- **Efficiency:** Semantic Caching in PostgreSQL.")
+        st.write("- **Accuracy:** Cross-Encoder Reranking.")
+
+    if st.button("🧹 Clear Analysis History", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
 # ==========================================
-# 3. SESSION STATE
+# 3. MAIN UI HEADER
+# ==========================================
+st.title("🍎 Apple Financial Analyst")
+st.markdown(f"""
+    This system provides high-precision answers based strictly on **Apple Inc. ({FIXED_TICKER})** SEC filings. 
+    It leverages semantic search to bypass the noise of standard LLMs.
+""")
+
+# ==========================================
+# 4. CHAT INTERFACE
 # ==========================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# ==========================================
-# 4. DISPLAY CHAT HISTORY
-# ==========================================
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# ==========================================
-# 5. USER INPUT
-# ==========================================
-if prompt := st.chat_input("E.g., Compare Apple's R&D spending to its revenue"):
+if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk factors..."):
 
-    # Show user message
     with st.chat_message("user"):
         st.markdown(prompt)
-
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # ======================================
-    # 6. CALL BACKEND
-    # ======================================
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
 
-        with st.spinner("Analyzing SEC Filings & Cross-Referencing..."):
+        with st.spinner("Retrieving SEC Filings & Reranking Context..."):
             try:
+                # Automatically injects AAPL into every request
                 payload = {
                     "query": prompt,
-                    "ticker": ticker,
+                    "ticker": FIXED_TICKER,
                     "top_k": top_k
                 }
 
@@ -85,92 +106,43 @@ if prompt := st.chat_input("E.g., Compare Apple's R&D spending to its revenue"):
 
                 if response.status_code == 200:
                     data = response.json()
-
-                    answer = data.get("answer", "No answer returned.")
-                    query_hash = data.get("query_hash")
+                    answer = data.get("answer", "No analysis available.")
                     is_cached = data.get("cached", False)
-                    provider = data.get("provider", "Unknown")
+                    provider = data.get("provider", "LLM")
                     sources = data.get("sources", [])
+                    query_hash = data.get("query_hash")
 
-                    # Simulated streaming effect
+                    # Typing effect
                     full_text = ""
                     for word in answer.split():
                         full_text += word + " "
-                        message_placeholder.markdown(full_text)
-                        time.sleep(0.01)
+                        message_placeholder.markdown(full_text + "▌")
+                        time.sleep(0.008)
+                    message_placeholder.markdown(full_text)
 
-                    # ==================================
-                    # METADATA DISPLAY
-                    # ==================================
-                    if is_cached:
-                        st.caption("⚡ Semantic Cache Hit — served from PostgreSQL")
-                    else:
-                        st.caption(f"🤖 Live Inference — {provider}")
-
-                    # ==================================
-                    # SOURCES VIEWER
-                    # ==================================
+                    # Performance Metadata
+                    cols = st.columns(3)
+                    with cols[0]:
+                        if is_cached:
+                            st.caption("⚡ **Source:** Semantic Cache (Postgres)")
+                        else:
+                            st.caption(f"🤖 **Inference:** {provider}")
+                    
+                    # Source Citation Expander
                     if sources:
-                        with st.expander("📚 Source Context & Reranker Scores"):
+                        with st.expander("📚 View Document Evidence"):
                             for i, src in enumerate(sources):
-                                st.markdown(
-                                    f"**Source {i+1} | {src.get('document_type', 'SEC Filing')}**"
-                                )
-                                st.write(src.get("text", ""))
-
                                 score = float(src.get("score", 0.0))
-                                st.progress(score, text=f"Relevance Score: {score:.4f}")
+                                st.markdown(f"**Chunk {i+1}** | Relevancy: `{score:.2%}`")
+                                st.caption(src.get("text", "")[:400] + "...")
                                 st.divider()
 
-                    # ==================================
-                    # FEEDBACK
-                    # ==================================
-                    if query_hash:
-                        st.write("---")
-                        st.write("Rate this analysis:")
-
-                        if f"voted_{query_hash}" not in st.session_state:
-                            c1, c2, _ = st.columns([1, 1, 10])
-
-                            with c1:
-                                if st.button("👍", key=f"up_{query_hash}"):
-                                    requests.post(
-                                        FEEDBACK_URL,
-                                        json={"query_hash": query_hash, "rating": 1},
-                                        timeout=5,
-                                    )
-                                    st.session_state[f"voted_{query_hash}"] = True
-                                    st.toast("Feedback recorded!")
-                                    st.rerun()
-
-                            with c2:
-                                if st.button("👎", key=f"down_{query_hash}"):
-                                    requests.post(
-                                        FEEDBACK_URL,
-                                        json={"query_hash": query_hash, "rating": -1},
-                                        timeout=5,
-                                    )
-                                    st.session_state[f"voted_{query_hash}"] = True
-                                    st.toast("Logged for review.")
-                                    st.rerun()
-                        else:
-                            st.caption("Thank you for your feedback! ⭐")
-
-                    # Save assistant message
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": answer}
-                    )
-
                 else:
-                    st.error(f"Backend Error ({response.status_code}): {response.text}")
-
-            except requests.exceptions.Timeout:
-                st.error("⏱️ Request timed out. Try reducing Top-K or check backend load.")
-
-            except requests.exceptions.ConnectionError:
-                st.error(
-                    "🚨 Connection failed — ensure FastAPI backend is running and reachable."
-                )
+                    st.error(f"Analysis failed. Backend returned: {response.status_code}")
 
             except Exception as e:
-                st.error(f"Unexpected error: {e}")
+                st.error(f"Connection Error: Ensure your EC2 endpoint is accessible. ({e})")
+
+    # Add to history
+    if 'answer' in locals():
+        st.session_state.messages.append({"role": "assistant", "content": answer})
