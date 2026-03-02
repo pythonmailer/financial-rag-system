@@ -1,4 +1,5 @@
 import time
+import math
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -6,104 +7,108 @@ from qdrant_client.http import models
 # ==========================================
 # 1. INITIALIZATION
 # ==========================================
-print("Loading Embedding Model and Qdrant...")
+print("🚀 Initializing Evaluation Suite...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# We use localhost because we run this script outside of Docker
-qdrant = QdrantClient(url="http://localhost:6333") 
+# UPDATE THIS: Use 'localhost' if running on the EC2 itself, 
+# or your EC2 Public IP (e.g., 'http://13.232.197.229:6333') if running from your laptop.
+QDRANT_URL = "http://13.232.197.229:6333" 
+qdrant = QdrantClient(url=QDRANT_URL)
 
 # ==========================================
-# 2. THE GOLDEN DATASET
+# 2. APPLE-SPECIFIC GOLDEN DATASET
 # ==========================================
-# This is our ground-truth testing set. 
-# We define the exact query, the target company, and the specific keywords 
-# we absolutely MUST find in the database chunks for the answer to be considered "accurate".
 EVAL_DATASET = [
     {
-        "query": "What are the primary risk factors for Apple?", 
+        "query": "What are Apple's primary risk factors regarding the supply chain?", 
         "ticker": "AAPL",
-        "expected_keywords": ["risk", "macroeconomic", "supply chain", "tariffs", "competition"]
+        "expected_keywords": ["supply chain", "components", "manufacturing", "china", "disruption"]
     },
     {
-        "query": "What was Apple's total net sales for the year?", 
+        "query": "What was the total net sales for iPhone in the recent fiscal year?", 
         "ticker": "AAPL",
-        "expected_keywords": ["net sales", "revenue", "billion", "total"]
+        "expected_keywords": ["iphone", "net sales", "billion", "revenue"]
     },
     {
-        "query": "How is Apple utilizing Artificial Intelligence?", 
+        "query": "How much did Apple spend on Research and Development (R&D)?", 
         "ticker": "AAPL",
-        "expected_keywords": ["machine learning", "ai", "neural engine", "generative"]
+        "expected_keywords": ["research and development", "R&D", "innovation", "expense"]
     },
     {
-        "query": "Who are Apple's main competitors?", 
+        "query": "What is Apple's strategy for Artificial Intelligence and Machine Learning?", 
         "ticker": "AAPL",
-        "expected_keywords": ["competitors", "competition", "android", "samsung", "google"]
+        "expected_keywords": ["neural engine", "machine learning", "ai", "intelligence", "generative"]
+    },
+    {
+        "query": "Discuss Apple's service sector revenue growth.", 
+        "ticker": "AAPL",
+        "expected_keywords": ["services", "subscription", "app store", "icloud", "growth"]
     }
 ]
 
 # ==========================================
-# 3. THE EVALUATION ENGINE
+# 3. THE EVALUATION ENGINE (MRR + HIT RATE)
 # ==========================================
 def run_evaluation(k=5):
-    print(f"\n📊 Running Retrieval Evaluation (Top {k} Chunks)...")
-    print("-" * 50)
+    print(f"\n📊 Evaluating Retrieval Performance (Top-{k})...")
+    print("-" * 60)
     
     hits = 0
+    reciprocal_ranks = []
     total_latency = 0
 
     for item in EVAL_DATASET:
         start_time = time.time()
         
-        # 1. Embed the test query
+        # 1. Vectorize query
         query_vector = model.encode(item["query"]).tolist()
         
-        # 2. Query Qdrant for the top K results
+        # 2. Search Qdrant with Metadata Filtering
         search_result = qdrant.query_points(
             collection_name="financial_documents",
             query=query_vector,
             limit=k,
             query_filter=models.Filter(
-                must=[models.FieldCondition(key="ticker", match=models.MatchValue(value=item["ticker"]))]
+                must=[models.FieldCondition(key="ticker", match=models.MatchValue(value=item['ticker']))]
             )
         )
         
-        latency = (time.time() - start_time) * 1000  # Convert to ms
+        latency = (time.time() - start_time) * 1000
         total_latency += latency
         
-        # 3. Extract the text from all retrieved chunks
-        retrieved_texts = [hit.payload.get("text", "").lower() for hit in search_result.points if hit.payload]
-        combined_text = " ".join(retrieved_texts)
+        # 3. Calculate Rank and MRR
+        found_at_rank = 0
+        for rank, hit in enumerate(search_result.points, start=1):
+            combined_text = hit.payload.get("text", "").lower()
+            if any(kw.lower() in combined_text for kw in item["expected_keywords"]):
+                found_at_rank = rank
+                break
         
-        # 4. Score the Retrieval (Hit or Miss)
-        # If at least ONE expected keyword is found in the retrieved chunks, we score a Hit.
-        # In a real enterprise system, you might require 2+ keywords or use an LLM as a judge.
-        is_hit = any(keyword.lower() in combined_text for keyword in item["expected_keywords"])
-        
-        if is_hit:
+        # 4. Scoring Logic
+        if found_at_rank > 0:
             hits += 1
-            print(f"✅ [HIT]  ({latency:.1f}ms) | {item['query']}")
+            rr = 1.0 / found_at_rank
+            reciprocal_ranks.append(rr)
+            print(f"✅ [HIT]  Rank: {found_at_rank} | {latency:4.1f}ms | {item['query'][:50]}...")
         else:
-            print(f"❌ [MISS] ({latency:.1f}ms) | {item['query']}")
-            print(f"   ↳ Missing Keywords: {item['expected_keywords']}")
+            reciprocal_ranks.append(0.0)
+            print(f"❌ [MISS] Rank: N/A | {latency:4.1f}ms | {item['query'][:50]}...")
 
     # ==========================================
-# 4. CALCULATE FINAL METRICS
-# ==========================================
+    # 4. CALCULATE FINAL METRICS
+    # ==========================================
+    avg_mrr = sum(reciprocal_ranks) / len(EVAL_DATASET)
     hit_rate = (hits / len(EVAL_DATASET)) * 100
     avg_latency = total_latency / len(EVAL_DATASET)
 
-    print("\n" + "="*50)
-    print(f"🏆 FINAL EVALUATION METRICS (Hit@{k})")
-    print("="*50)
-    print(f"Total Test Queries: {len(EVAL_DATASET)}")
-    print(f"Successful Hits:    {hits}")
-    print(f"Hit Rate Accuracy:  {hit_rate:.1f}%")
-    print(f"Avg Search Latency: {avg_latency:.1f} ms")
-    print("="*50 + "\n")
+    print("\n" + "="*60)
+    print(f"🏆 EVALUATION RESULTS (k={k})")
+    print("="*60)
+    print(f"Accuracy (Hit@{k}):   {hit_rate:.1f}%")
+    print(f"Precision (MRR):     {avg_mrr:.3f}  (1.0 is Perfect)")
+    print(f"Avg Search Latency:  {avg_latency:.1f} ms")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
-    # Test strict retrieval (Can it find the answer in just 3 chunks?)
-    run_evaluation(k=3)
-    
-    # Test standard retrieval (Can it find the answer in 5 chunks?)
+    # Standard benchmark
     run_evaluation(k=5)
