@@ -94,35 +94,23 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # ==========================================
-# SAFE SCORE NORMALIZATION
-# ==========================================
-def normalize_score(raw_score):
-    try:
-        raw_score = float(raw_score)
-    except:
-        raw_score = 0.0
-
-    if math.isnan(raw_score) or math.isinf(raw_score):
-        raw_score = 0.0
-
-    # Prevent math overflow by capping extreme values
-    raw_score = max(min(raw_score, 10), -10)
-    
-    # Sigmoid function: turns logits (like 5.24) into percentages (like 0.99)
-    norm_score = 1 / (1 + math.exp(-raw_score))
-    return max(0.0, min(1.0, norm_score))
-
-# ==========================================
-# 7. STREAM GENERATOR (SIMPLIFIED)
+# 6. PERFECT STREAM GENERATOR
 # ==========================================
 def stream_tokens(text):
-    words = text.split(" ")
-    for word in words:
-        yield word + " "
-        time.sleep(0.015)
+    """Yields text smoothly while perfectly preserving newlines and markdown formatting."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        words = line.split(' ')
+        for word in words:
+            yield word + ' '
+            time.sleep(0.01) # Smooth typing speed
+        
+        # Add the newline character back at the end of the line
+        if i < len(lines) - 1:
+            yield '\n'
 
 # ==========================================
-# 8. CHAT INPUT
+# 7. CHAT INPUT
 # ==========================================
 if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
 
@@ -151,13 +139,13 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
                 except Exception as e:
                     st.error(f"Connection Error: {e}")
 
-            # 🛑 EXECUTE OUTSIDE THE SPINNER TO PREVENT INFINITE LOOPING 🛑
+            # 🛑 EXECUTE OUTSIDE THE SPINNER
             if response is not None and response.status_code == 200:
                 data = response.json()
 
                 answer = data.get("answer", "No analysis available.")
                 
-                # 🚨 THE FIX: Stop Streamlit from turning money into green math equations
+                # Stop Streamlit from turning money into green LaTeX math equations
                 answer = answer.replace("$", r"\$")
                 
                 sources = data.get("sources", [])
@@ -170,7 +158,7 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
                 st.session_state.last_provider = provider
                 st.session_state.last_cached = is_cached
 
-                # Stream text safely
+                # Stream text safely using the newline-preserving generator
                 st.write_stream(stream_tokens(answer))
                 st.session_state.streaming_done = True
 
@@ -203,17 +191,25 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
         with st.expander("📚 View Document Evidence"):
             for i, src in enumerate(st.session_state.last_sources):
                 
-                # 1. Get the raw cross-encoder score (e.g. 5.24)
-                raw_score = src.get("score", 0.0)
-                
-                # 2. Use the normalize function to squash it to 0.0 - 1.0
-                normalized_score = normalize_score(raw_score)
-                
-                # 3. Double-clamp it just to be 100% safe for Streamlit
-                safe_score = max(0.0, min(1.0, float(normalized_score)))
+                # 1. Get raw cross-encoder score safely
+                try:
+                    raw_score = float(src.get("score", 0.0))
+                except (ValueError, TypeError):
+                    raw_score = 0.0
+
+                # 2. Hard Sigmoid clamping (Forces any number to become 0.0 -> 1.0)
+                if raw_score > 10.0:
+                    norm_score = 1.0
+                elif raw_score < -10.0:
+                    norm_score = 0.0
+                else:
+                    norm_score = 1.0 / (1.0 + math.exp(-raw_score))
+
+                # 3. Absolute final failsafe guard for Streamlit
+                safe_score = max(0.0, min(1.0, norm_score))
 
                 st.markdown(f"**Chunk {i+1}** | Relevancy: `{safe_score:.2%}`")
-                st.progress(safe_score) # Now guaranteed to be valid!
+                st.progress(safe_score) 
                 st.caption(src.get("text", "")[:400] + "...")
                 st.divider()
 
