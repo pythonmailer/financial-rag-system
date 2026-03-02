@@ -25,7 +25,7 @@ COLLECTION_NAME = "financial_documents"
 
 request_queue = None
 MAX_BATCH_SIZE = 32
-MAX_CONCURRENT_LLM_CALLS = 10
+MAX_CONCURRENT_LLM_CALLS = 25
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
 # ==========================================
@@ -176,6 +176,16 @@ def queue_status():
     return {"queue_size": request_queue.qsize() if request_queue else 0}
 
 # ==========================================
+# QUERY ROUTER
+# ==========================================
+def route_query(query: str) -> str:
+    """Lightweight heuristic to classify queries as SIMPLE or COMPLEX."""
+    complex_keywords = ["compare", "analyze", "why", "impact", "trends", "growth", "risk"]
+    if len(query.split()) > 20 or any(kw in query.lower() for kw in complex_keywords):
+        return "COMPLEX"
+    return "SIMPLE"
+
+# ==========================================
 # RETRIEVAL & RERANK
 # ==========================================
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
@@ -213,13 +223,17 @@ if not TESTING:
         return await asyncio.wait_for(client.chat.completions.create(model=model_name, messages=messages, temperature=0.2), timeout=12)
 
 @trace(name="Generate_Answer")
-async def generate_answer(system_prompt, user_query):
+async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
     if TESTING: return "Mock answer.", "Mock"
     msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
+    
+    # 🚨 DYNAMIC ROUTING: Use 8B for fast queries, 70B for deep analysis
+    groq_model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
+
     if groq_breaker.is_healthy:
         try:
-            res = await safe_llm_call(primary_client, "llama-3.1-8b-instant", msgs)
-            return res.choices[0].message.content, "Groq"
+            res = await safe_llm_call(primary_client, groq_model, msgs)
+            return res.choices[0].message.content, f"Groq ({groq_model})"
         except: groq_breaker.trip()
     if gemini_client and gemini_breaker.is_healthy:
         try:
@@ -237,26 +251,61 @@ async def generate_answer(system_prompt, user_query):
 # PROCESS (WORKER)
 # ==========================================
 @trace(name="Full_RAG_Pipeline")
-async def process_independently(i, fut, req, q_hash, batch_vectors):
+async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time, embed_ms):
+    # 🚨 Calculate Time-in-Queue
+    queue_wait_ms = (time.time() - req_arrival_time) * 1000
+
     async with llm_semaphore:
         try:
+            # 1. ROUTER TIMING
+            t0 = time.time()
+            with start_span(name="Query_Router"):
+                complexity = route_query(req.query)
+            router_ms = (time.time() - t0) * 1000
+
+            # 2. RETRIEVAL TIMING
+            t1 = time.time()
             with start_span(name="Qdrant_Vector_Search"):
                 search = await asyncio.to_thread(retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type)
+            qdrant_ms = (time.time() - t1) * 1000
+
             texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
             
+            rerank_ms = 0
             if not texts:
                 combined, sources = "No context found.", []
             else:
+                # 3. RERANK TIMING
+                t2 = time.time()
                 with start_span(name="CrossEncoder_Rerank"):
                     idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
+                rerank_ms = (time.time() - t2) * 1000
+                
                 combined = "\n\n".join([texts[j] for j in idx])
                 sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
 
+            # 4. LLM GENERATION TIMING
+            t3 = time.time()
+            answer, provider = await generate_answer(f"Analyst context:\n{combined}", req.query, complexity)
+            llm_ms = (time.time() - t3) * 1000
+
+            # 5. LOG EXPLICIT METRICS TO MLFLOW
             if not TESTING:
                 mlflow.set_tag("ticker", req.ticker)
+                mlflow.set_tag("query_complexity", complexity)
                 mlflow.log_metric("retrieved_docs", len(texts))
+                
+                # The complete lifecycle!
+                mlflow.log_metric("queue_wait_ms", queue_wait_ms)
+                mlflow.log_metric("embed_latency_ms", embed_ms)
+                mlflow.log_metric("router_latency_ms", router_ms)
+                mlflow.log_metric("qdrant_latency_ms", qdrant_ms)
+                if texts: mlflow.log_metric("rerank_latency_ms", rerank_ms)
+                mlflow.log_metric("llm_latency_ms", llm_ms)
+                
+                # Total End-to-End time
+                mlflow.log_metric("total_e2e_ms", (time.time() - req_arrival_time) * 1000)
 
-            answer, provider = await generate_answer(f"Analyst context:\n{combined}", req.query)
             asyncio.create_task(asyncio.to_thread(save_to_cache, q_hash, req.query, answer, req.ticker, provider))
 
             fut.set_result({"query_hash": q_hash, "query": req.query, "answer": answer, "sources": sources, "cached": False, "provider": provider})
@@ -269,19 +318,28 @@ async def process_independently(i, fut, req, q_hash, batch_vectors):
 async def batch_processor():
     while True:
         batch = []
-        fut, req, q_hash, ctx = await request_queue.get()
-        batch.append((fut, req, q_hash, ctx))
+        # Unpack the new arrival time variable
+        fut, req, q_hash, ctx, req_arrival_time = await request_queue.get()
+        batch.append((fut, req, q_hash, ctx, req_arrival_time))
         await asyncio.sleep(0.05)
 
         while not request_queue.empty() and len(batch) < MAX_BATCH_SIZE:
             batch.append(request_queue.get_nowait())
 
         queries = [item[1].query for item in batch]
-        vectors = await asyncio.to_thread(embed_query_batch, queries)
+        
+        # 🚨 Time the Embedding step!
+        t_embed = time.time()
+        with start_span(name="Batch_Embed_Queries"):
+            vectors = await asyncio.to_thread(embed_query_batch, queries)
+        embed_ms = (time.time() - t_embed) * 1000 / len(batch) # Average per query
 
-        for i, (fut, req, q_hash, ctx) in enumerate(batch):
-            # 🚨 FIX: Pass context into task so MLFlow connects it to the parent span
-            ctx.run(asyncio.create_task, process_independently(i, fut, req, q_hash, vectors))
+        for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
+            ctx.run(
+                asyncio.create_task,
+                # Pass arrival_time and embed_ms to the worker
+                process_independently(i, fut, req, q_hash, vectors, req_arrival_time, embed_ms),
+            )
 
 # ==========================================
 # LIFESPAN
@@ -318,12 +376,13 @@ async def _ask_impl(req: QueryRequest, db: Session):
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
     
-    # 🚨 FIX: Capture the MLFlow context from FastAPI and push it down the queue
     ctx = contextvars.copy_context()
-    await request_queue.put((fut, req, q_hash, ctx))
+    req_arrival_time = time.time() # 🚨 Capture arrival time
+    
+    # Pass it into the queue
+    await request_queue.put((fut, req, q_hash, ctx, req_arrival_time))
 
     try:
-        # Increased to 90s to prevent 504 timeouts when the queue is stacked with 100 requests
         return await asyncio.wait_for(fut, timeout=90)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Queue timeout")
