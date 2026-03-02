@@ -19,22 +19,12 @@ from sqlalchemy.orm import Session
 
 load_dotenv()
 
-# ==========================================
-# 🌐 INFRA CONFIG
-# ==========================================
 AWS_IP = "13.232.197.229"
 QDRANT_URL = os.getenv("QDRANT_URL", f"http://{AWS_IP}:6333")
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"http://{AWS_IP}:5001")
-DB_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgresql://admin:adminpassword@{AWS_IP}:5432/financial_rag"
-)
 
 from database import SessionLocal, CacheEntry
 
-# ==========================================
-# CONFIG
-# ==========================================
 TESTING = os.getenv("TESTING", "False") == "True"
 USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
 COLLECTION_NAME = "financial_documents"
@@ -47,9 +37,6 @@ llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 class EmbedRequest(BaseModel):
     texts: list[str]
 
-# ==========================================
-# MLflow & HEAVY IMPORTS
-# ==========================================
 if not TESTING:
     import mlflow
     import mlflow.openai
@@ -71,9 +58,6 @@ else:
     def start_span(*args, **kwargs):
         yield None
 
-# ==========================================
-# LAZY LOADERS
-# ==========================================
 @lru_cache()
 def get_embedder():
     if TESTING:
@@ -97,9 +81,6 @@ def get_qdrant():
         return None
     return QdrantClient(url=QDRANT_URL)
 
-# ==========================================
-# LLM CLIENT
-# ==========================================
 if not TESTING:
     primary_client = AsyncOpenAI(
         base_url="https://api.groq.com/openai/v1",
@@ -108,9 +89,6 @@ if not TESTING:
 else:
     primary_client = None
 
-# ==========================================
-# APP INIT
-# ==========================================
 app = FastAPI(title="Financial RAG API")
 if not TESTING:
     FastAPIInstrumentor.instrument_app(app)
@@ -128,9 +106,6 @@ class QueryRequest(BaseModel):
     document_type: str | None = None
     top_k: int = 5
 
-# ==========================================
-# CORE LOGIC
-# ==========================================
 def route_query(query: str) -> str:
     complex_keywords = ["compare", "analyze", "why", "impact", "trends", "growth", "risk"]
     return "COMPLEX" if len(query.split()) > 20 or any(kw in query.lower() for kw in complex_keywords) else "SIMPLE"
@@ -187,9 +162,6 @@ if not TESTING:
             timeout=12,
         )
 
-# ==========================================
-# PROCESS PIPELINE (MLflow WATERFALL ENABLED)
-# ==========================================
 async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time):
     with start_span(name=f"RAG-Workflow-{req.ticker}") as root_span:
         async with llm_semaphore:
@@ -197,12 +169,10 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 if root_span:
                     root_span.set_inputs({"user_query": req.query, "ticker": req.ticker})
 
-                # ROUTER
                 with start_span(name="1_Query_Routing", span_type=SpanType.TOOL) as span:
                     complexity = route_query(req.query)
                     span.set_outputs({"routing_result": complexity})
 
-                # RETRIEVAL
                 with start_span(name="2_Vector_Retrieval", span_type=SpanType.RETRIEVER) as span:
                     t_start = time.time()
                     search = await asyncio.to_thread(
@@ -232,7 +202,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                         sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
                         span.set_outputs({"reranked_top_k": len(idx)})
 
-                # LLM
                 answer, provider = await generate_answer(
                     f"Analyst context:\n{combined}",
                     req.query,
@@ -242,7 +211,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 if root_span:
                     root_span.set_outputs({"final_answer": answer, "provider": provider})
 
-                # MLflow metrics (attach to active run)
                 if not TESTING:
                     mlflow.log_metric("qdrant_ms", float(q_latency))
                     mlflow.log_metric("rerank_ms", float(rerank_ms))
@@ -251,7 +219,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                         float((time.time() - req_arrival_time) * 1000),
                     )
 
-                # CACHE
                 try:
                     db = SessionLocal()
                     db.add(
@@ -284,9 +251,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                     root_span.set_attribute("error", str(e))
                 fut.set_exception(e)
 
-# ==========================================
-# BATCH ENGINE
-# ==========================================
 async def batch_processor():
     while True:
         batch = []
@@ -301,7 +265,9 @@ async def batch_processor():
 
         queries = [item[1].query for item in batch]
 
-        with start_span(name="Batch_Embedding", span_type=SpanType.TOOL):
+        with start_span(name="Batch_Embedding", span_type=SpanType.TOOL) as span:
+            if span:
+                span.set_attribute("batch_size", len(queries))
             vectors = await asyncio.to_thread(embed_query_batch, queries)
 
         for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
@@ -312,9 +278,6 @@ async def batch_processor():
                 ),
             )
 
-# ==========================================
-# LIFESPAN
-# ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global request_queue
@@ -335,9 +298,6 @@ async def lifespan(app: FastAPI):
 
 app.router.lifespan_context = lifespan
 
-# ==========================================
-# ENDPOINTS
-# ==========================================
 @app.post("/ask")
 async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     q_hash = hashlib.sha256(f"{req.ticker}_{req.query.lower()}".encode()).hexdigest()
@@ -357,7 +317,7 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     await request_queue.put((fut, req, q_hash, ctx, time.time()))
 
     if not TESTING:
-        with mlflow.start_run(run_name=f"Request-{req.ticker}", nested=True):
+        with mlflow.start_run(run_name=f"Request-{req.ticker}"):
             return await asyncio.wait_for(fut, timeout=90)
 
     return await asyncio.wait_for(fut, timeout=90)
