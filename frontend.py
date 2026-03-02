@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import os
 import time
+import math  # Required for Sigmoid normalization
 
 # ==========================================
 # 1. CONFIGURATION & THEMING
@@ -54,7 +55,7 @@ with st.sidebar:
 
     st.divider()
     
-    # Resume Highlight Section (Great for recruiters!)
+    # Resume Highlight Section
     with st.expander("🚀 Tech Highlights"):
         st.write("- **Hybrid RAG:** Groq/Gemini LPU inference.")
         st.write("- **Vector DB:** Qdrant with Metadata Filtering.")
@@ -95,7 +96,6 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
 
         with st.spinner("Retrieving SEC Filings & Reranking Context..."):
             try:
-                # Automatically injects AAPL into every request
                 payload = {
                     "query": prompt,
                     "ticker": FIXED_TICKER,
@@ -110,7 +110,6 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
                     is_cached = data.get("cached", False)
                     provider = data.get("provider", "LLM")
                     sources = data.get("sources", [])
-                    query_hash = data.get("query_hash")
 
                     # Typing effect
                     full_text = ""
@@ -128,12 +127,22 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
                         else:
                             st.caption(f"🤖 **Inference:** {provider}")
                     
-                    # Source Citation Expander
+                    # Source Citation Expander (FIXED FOR RERANKER LOGITS)
                     if sources:
                         with st.expander("📚 View Document Evidence"):
                             for i, src in enumerate(sources):
-                                score = float(src.get("score", 0.0))
-                                st.markdown(f"**Chunk {i+1}** | Relevancy: `{score:.2%}`")
+                                # Logic to handle raw Cross-Encoder scores
+                                raw_score = float(src.get("score", 0.0))
+                                
+                                # Sigmoid normalization to 0.0 - 1.0 range
+                                # 1 / (1 + e^-x)
+                                norm_score = 1 / (1 + math.exp(-raw_score))
+                                
+                                # Final clipping for Streamlit safety
+                                final_score = max(0.0, min(1.0, norm_score))
+
+                                st.markdown(f"**Chunk {i+1}** | Relevancy: `{final_score:.2%}`")
+                                st.progress(final_score) 
                                 st.caption(src.get("text", "")[:400] + "...")
                                 st.divider()
 
@@ -143,6 +152,5 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
             except Exception as e:
                 st.error(f"Connection Error: Ensure your EC2 endpoint is accessible. ({e})")
 
-    # Add to history
     if 'answer' in locals():
         st.session_state.messages.append({"role": "assistant", "content": answer})
