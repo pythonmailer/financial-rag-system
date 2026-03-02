@@ -1,4 +1,4 @@
-# main2.py -- Production RAG with MLflow (Old Working Style Restored)
+# main2.py -- Production RAG with MLflow (Old Working Style Restored - FIXED)
 
 import os
 import time
@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 
 from fastapi import FastAPI, Depends
-from mlflow.entities import SpanType
+from mlflow.tracing import SpanType   # ✅ CORRECT IMPORT
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
@@ -182,7 +182,7 @@ if not TESTING:
         )
 
 # ==========================================
-# PROCESS (Exact Old Style)
+# PROCESS (Exact Old Working Style)
 # ==========================================
 async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time):
     with start_span(name=f"RAG-Workflow-{req.ticker}") as root_span:
@@ -203,7 +203,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                         req.document_type,
                     )
                     q_latency = (time.time() - t_start) * 1000
-
                     texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
 
                 if not texts:
@@ -216,7 +215,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                             rerank_documents, req.query, texts, req.top_k
                         )
                         rerank_ms = (time.time() - t_rerank) * 1000
-
                         combined = "\n\n".join([texts[j] for j in idx])
                         sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
 
@@ -252,7 +250,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
 async def batch_processor():
     while True:
         batch = []
-
         fut, req, q_hash, ctx, req_arrival_time = await request_queue.get()
         batch.append((fut, req, q_hash, ctx, req_arrival_time))
 
@@ -269,9 +266,7 @@ async def batch_processor():
         for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
             ctx.run(
                 asyncio.create_task,
-                process_independently(
-                    i, fut, req, q_hash, vectors, req_arrival_time
-                ),
+                process_independently(i, fut, req, q_hash, vectors, req_arrival_time),
             )
 
 # ==========================================
@@ -288,8 +283,8 @@ async def lifespan(app: FastAPI):
             mlflow.set_experiment("Financial-RAG")
             mlflow.openai.autolog(log_traces=True)
             print(f"✅ MLflow connected: {MLFLOW_URI}")
-        except:
-            print("⚠️ MLflow Offline")
+        except Exception as e:
+            print("⚠️ MLflow Offline:", e)
 
     task = asyncio.create_task(batch_processor())
     yield
