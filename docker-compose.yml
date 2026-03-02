@@ -32,6 +32,8 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
+    environment:
+      - MLFLOW_HTTP_HOST_VALIDATION_DISABLED=true
     command: >
       mlflow server
       --backend-store-uri sqlite:////mlruns/mlflow.db
