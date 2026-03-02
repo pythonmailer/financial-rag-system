@@ -28,7 +28,7 @@ services:
       retries: 5
       start_period: 15s
 
-mlflow:
+  mlflow:  # <--- WAS INDENTED WRONG, NOW FIXED
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow_server
     command: >
@@ -39,7 +39,7 @@ mlflow:
       --port 5001
       --allowed-hosts "*"
       --cors-allowed-origins "*"
-      --disable-security-middleware  # <--- The "Get It Working" Button
+      --disable-security-middleware
     environment:
       - MLFLOW_FLASK_SERVER_SECRET_KEY=super-secret-key-for-resume
       - MLFLOW_HTTP_REQUEST_TIMEOUT=600
@@ -51,7 +51,6 @@ mlflow:
 
   backend:
     build: .
-    # Added --timeout-keep-alive 120 to mitigate 504 Gateway Timeouts
     command: uvicorn main2:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 120
     ports:
       - "8001:8001"
