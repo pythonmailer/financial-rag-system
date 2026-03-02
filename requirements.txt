@@ -48,11 +48,12 @@ streamlit
 # ==============================
 # MLFLOW + GENAI TRACING
 # ==============================
-mlflow[genai]
+mlflow[genai]>=2.11.0
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-instrumentation
 opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp
 
 # ==============================
 # ASYNC / RETRIES / SCHEDULING
