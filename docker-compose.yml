@@ -1,12 +1,15 @@
+version: '3.8'
+
 services:
   postgres:
     image: postgres:15-alpine
+    container_name: postgres
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: adminpassword
       POSTGRES_DB: financial_rag
     ports:
-      - "5432:5432" # ✅ FIXED: Removed 127.0.0.1 so backend can connect on AWS
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -15,9 +18,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: qdrant
     ports:
       - "6333:6333"
     volumes:
@@ -32,8 +37,10 @@ services:
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
+    container_name: mlflow
     environment:
-      - MLFLOW_HTTP_HOST_VALIDATION_DISABLED=true
+      # Fix for 403 Forbidden / DNS Rebinding error
+      MLFLOW_HTTP_HOST_VALIDATION_DISABLED: "true"
     command: >
       mlflow server
       --backend-store-uri sqlite:////mlruns/mlflow.db
@@ -48,6 +55,8 @@ services:
 
   backend:
     build: .
+    container_name: backend
+    # Increased timeout to prevent worker kills during heavy RAG math
     command: uvicorn main2:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 120
     ports:
       - "8001:8001"
@@ -56,9 +65,10 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       HF_TOKEN: ${HF_TOKEN}
-      DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
-      QDRANT_URL: http://qdrant:6333
-      MLFLOW_TRACKING_URI: http://mlflow:5001
+      # Aligned with hardcoded AWS IP logic
+      DATABASE_URL: postgresql://admin:adminpassword@13.232.197.229:5432/financial_rag
+      QDRANT_URL: http://13.232.197.229:6333
+      MLFLOW_TRACKING_URI: http://13.232.197.229:5001
       MLFLOW_EXPERIMENT_NAME: "Apple_Financial_RAG"
       TESTING: "False"
       PYTHONPATH: /app
@@ -69,21 +79,22 @@ services:
       mlflow:
         condition: service_started
     healthcheck:
-      # Added health check to wait for the ML model to load before marking as healthy
-      test: ["CMD", "curl", "-f", "http://localhost:8001/ready"]
-      interval: 20s
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/ready || exit 1"]
+      interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 60s
+      retries: 3
+      start_period: 90s
     restart: unless-stopped
 
   frontend:
     build: .
+    container_name: frontend
     command: streamlit run frontend.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     environment:
-      BACKEND_URL: http://backend:8001
+      # Pointing directly to the Public IP for consistent routing
+      BACKEND_URL: http://13.232.197.229:8001
       PYTHONPATH: /app
     depends_on:
       backend:
@@ -92,13 +103,14 @@ services:
 
   ingestor:
     build: .
+    container_name: ingestor
     command: python ingest.py
     volumes:
       - ./sec_data:/app/sec_data
     environment:
-      QDRANT_URL: http://qdrant:6333
-      BACKEND_URL: http://backend:8001
-      DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
+      QDRANT_URL: http://13.232.197.229:6333
+      BACKEND_URL: http://13.232.197.229:8001
+      DATABASE_URL: postgresql://admin:adminpassword@13.232.197.229:5432/financial_rag
       PYTHONPATH: /app
     depends_on:
       backend:

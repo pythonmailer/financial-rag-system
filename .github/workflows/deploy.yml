@@ -50,7 +50,6 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
-          # Note: Exporting variables for use in the remote script
           envs: GROQ_API_KEY,GEMINI_API_KEY,OPENROUTER_API_KEY,HF_TOKEN
           script: |
             set -e
@@ -64,52 +63,52 @@ jobs:
               sudo usermod -aG docker ubuntu
             fi
 
-            # 2. & 3. Smart Git Setup: Clone or Repair Metadata
+            # 2. Smart Git Setup
             if [ -d "$HOME/financial-rag-system" ]; then
               if [ ! -d "$HOME/financial-rag-system/.git" ]; then
-                echo "⚠️ Directory exists but is NOT a git repo. Cleaning up..."
+                echo "⚠️ Cleaning up non-git directory..."
                 sudo rm -rf "$HOME/financial-rag-system"
                 git clone https://github.com/pythonmailer/financial-rag-system ~/financial-rag-system
               fi
             else
-              echo "📥 Cloning fresh repository..."
+              echo "📥 Cloning repository..."
               git clone https://github.com/pythonmailer/financial-rag-system ~/financial-rag-system
             fi
 
             cd ~/financial-rag-system
-            echo "📥 Syncing latest code from Main..."
+            echo "📥 Syncing code..."
             git fetch origin main
             git reset --hard origin/main
 
-            # 4. Generate Production .env (Fixed with HF_TOKEN)
+            # 4. Generate Production .env (Aligned with 13.232.197.229 logic)
+            # Note: We use the Elastic IP to avoid DNS resolution delays on startup
             echo "📝 Updating .env file..."
-            printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nHF_TOKEN=%s\nDATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag\nMLFLOW_TRACKING_URI=http://mlflow:5001\nQDRANT_URL=http://qdrant:6333\nTESTING=False\nUSE_GPU=False\n" \
+            printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nHF_TOKEN=%s\nDATABASE_URL=postgresql://admin:adminpassword@13.232.197.229:5432/financial_rag\nMLFLOW_TRACKING_URI=http://13.232.197.229:5001\nQDRANT_URL=http://13.232.197.229:6333\nTESTING=False\nUSE_GPU=False\n" \
             "$GROQ_API_KEY" "$GEMINI_API_KEY" "$OPENROUTER_API_KEY" "$HF_TOKEN" > .env
 
-            # 5. Build and Deploy Strategy
-            echo "🧹 Stopping services and pruning old builds..."
+            # 5. Refresh Containers
+            echo "🧹 Refreshing services..."
             sudo docker compose down
-            # Optional: Clear unused images to save disk space on EC2
             sudo docker image prune -f
 
-            echo "🏗️ Rebuilding and Launching All Containers..."
+            echo "🏗️ Rebuilding and Launching..."
             sudo docker compose up -d --build
 
-            # 6. Run Database Migrations
-            echo "📦 Checking migrations..."
-            sudo docker compose run --rm backend alembic upgrade head || echo "⚠️ Alembic migration skipped or failed."
+            # 6. Database Migrations
+            echo "📦 Running Migrations..."
+            sudo docker compose run --rm backend alembic upgrade head || echo "⚠️ Alembic skipped."
 
-            # 7. Post-Deployment Health Check
-            echo "⏳ Verifying Backend Status..."
-            for i in {1..15}; do
+            # 7. Post-Deployment Health Check (Wait up to 100 seconds)
+            echo "⏳ Waiting for Backend to initialize models..."
+            for i in {1..20}; do
               if curl -s http://localhost:8001/ready | grep -q '"ready"'; then
-                echo "✅ DEPLOYMENT SUCCESSFUL: AlphaPredict is live!"
+                echo "✅ DEPLOYMENT SUCCESSFUL!"
                 exit 0
               fi
-              echo "Backend still initializing models... ($i/15)"
+              echo "Still loading... ($i/20)"
               sleep 5
             done
 
-            echo "❌ ERROR: Deployment timed out. Showing logs for debugging..."
-            sudo docker compose logs backend
+            echo "❌ ERROR: Backend failed to start. Printing logs..."
+            sudo docker compose logs --tail 50 backend
             exit 1

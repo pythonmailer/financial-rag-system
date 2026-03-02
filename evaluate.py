@@ -1,34 +1,24 @@
 import time
 import math
-import socket
 import os
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 # ==========================================
-# 🤖 SMART AUTO-DETECTION (No IP Needed)
+# 🌐 HARDCODED INFRASTRUCTURE CONFIG
 # ==========================================
-def resolve_qdrant_url():
-    """
-    On AWS: Resolves to the 'qdrant' container name.
-    On Mac: Fails resolution and falls back to localhost.
-    """
-    try:
-        # Check if we can see the 'qdrant' container (Docker Network)
-        socket.gethostbyname("qdrant")
-        return "http://qdrant:6333"
-    except socket.gaierror:
-        # We are running locally on the Mac Mini
-        return "http://localhost:6333"
+# Using your provided AWS Elastic IP directly
+AWS_IP = "13.232.197.229"
 
-# Automatically set the URL based on where we are standing
-QDRANT_URL = os.getenv("QDRANT_URL", resolve_qdrant_url())
+# Prefer the env var from docker-compose, fallback to the AWS IP
+QDRANT_URL = os.getenv("QDRANT_URL", f"http://{AWS_IP}:6333")
 
 # ==========================================
 # 1. INITIALIZATION
 # ==========================================
 print(f"🚀 Initializing Evaluation Suite on: {QDRANT_URL}")
+# Note: Using the same model as your embedder for consistency
 model = SentenceTransformer("all-MiniLM-L6-v2")
 qdrant = QdrantClient(url=QDRANT_URL)
 
@@ -136,5 +126,4 @@ def run_evaluation(k=5):
     print("="*60 + "\n")
 
 if __name__ == "__main__":
-    # Standard benchmark
     run_evaluation(k=5)

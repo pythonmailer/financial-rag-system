@@ -3,7 +3,6 @@ import uuid
 import hashlib
 import requests
 import time
-import socket
 import math
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
@@ -13,26 +12,17 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, Distance, VectorParams
 
 # ==========================================
-# 🤖 SMART AUTO-DETECTION
+# 🌐 HARDCODED INFRASTRUCTURE CONFIG
 # ==========================================
-def resolve_host(service_name, default="localhost"):
-    try:
-        socket.gethostbyname(service_name)
-        return service_name
-    except socket.gaierror:
-        return default
+# Using your provided AWS Elastic IP for the Backend
+AWS_IP = "13.232.197.229"
 
-# Detect hosts
-QDRANT_HOST_NAME = resolve_host("qdrant", "localhost")
-BACKEND_HOST_NAME = resolve_host("backend", "localhost")
+# In Docker, the ingestor talks to 'qdrant' over the internal bridge.
+# If running locally, you can override these with .env
+QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+BACKEND_URL = os.getenv("BACKEND_URL", f"http://{AWS_IP}:8001")
 
-# ==========================================
-# CONFIG
-# ==========================================
-QDRANT_URL = os.getenv("QDRANT_URL", f"http://{QDRANT_HOST_NAME}:6333")
-BACKEND_URL = os.getenv("BACKEND_URL", f"http://{BACKEND_HOST_NAME}:8001")
 COLLECTION_NAME = "financial_documents"
-
 EMBED_URL = f"{BACKEND_URL}/embed"
 READY_URL = f"{BACKEND_URL}/ready"
 
@@ -46,17 +36,17 @@ print(f"🛠️ Configured Ingestor: Backend @ {BACKEND_URL} | Qdrant @ {QDRANT_
 # WAIT FOR BACKEND
 # ==========================================
 def wait_for_backend():
-    print("⏳ Waiting for backend readiness...")
+    print(f"⏳ Checking backend readiness at {READY_URL}...")
     for i in range(30):
         try:
-            r = requests.get(READY_URL, timeout=3)
-            if r.status_code == 200 and r.json().get("status") == "ready":
+            r = requests.get(READY_URL, timeout=5)
+            if r.status_code == 200:
                 print("✅ Backend is ready")
                 return
-        except:
+        except Exception as e:
             pass
         print(f"   (Retrying... {i+1}/30)")
-        time.sleep(2)
+        time.sleep(3)
     raise RuntimeError(f"❌ Backend at {BACKEND_URL} not ready")
 
 # ==========================================
@@ -64,12 +54,13 @@ def wait_for_backend():
 # ==========================================
 def embed_chunks(chunks):
     embeddings = []
-    print(f"🧠 Embedding {len(chunks)} chunks...")
+    print(f"🧠 Embedding {len(chunks)} chunks via Backend...")
     
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i : i + BATCH_SIZE]
         try:
-            r = requests.post(EMBED_URL, json={"texts": batch}, timeout=120)
+            # Increased timeout for heavy batch embedding
+            r = requests.post(EMBED_URL, json={"texts": batch}, timeout=180)
             r.raise_for_status()
             embeddings.extend(r.json()["embeddings"])
         except Exception as e:
@@ -98,7 +89,7 @@ def ensure_collection(qdrant):
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(
-                size=384,  # must match BGE embedding model
+                size=384,  # BGE-small-en-v1.5 vector size
                 distance=Distance.COSINE,
             ),
         )
@@ -120,10 +111,10 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
 
     wait_for_backend()
 
+    # Connection to Qdrant (Internal Docker DNS)
     qdrant = QdrantClient(url=QDRANT_URL)
     ensure_collection(qdrant)
 
-    # Use a generic name and your real email as required by SEC
     dl = Downloader("FinancialRAGProject", "chiragg948@gmail.com", "./sec_data")
 
     total_chunks = 0
@@ -134,9 +125,12 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
 
         base_path = f"./sec_data/sec-edgar-filings/{ticker}/{f_type}"
 
+        if not os.path.exists(base_path):
+            print(f"⚠️ No data found for {f_type}")
+            continue
+
         for root, _, files in os.walk(base_path):
             for file in files:
-                # SEC often names the main file 'primary_document.html'
                 if file.endswith(".html") or file == "primary_document.html":
                     html_path = os.path.join(root, file)
                     print(f"📄 Processing {html_path}")
@@ -149,9 +143,8 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
                     embeddings = embed_chunks(chunks)
 
                     points = []
-
                     for chunk, vector in zip(chunks, embeddings):
-                        # Unique ID based on content to prevent duplicates
+                        # Unique ID to prevent duplicate chunks in Qdrant
                         chunk_hash = hashlib.md5(
                             f"{ticker}_{f_type}_{chunk[:100]}".encode()
                         ).hexdigest()
@@ -177,7 +170,7 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
                     )
 
                     total_chunks += len(points)
-                    print(f"✅ Upserted {len(points)} vectors to Qdrant")
+                    print(f"✅ Indexed {len(points)} vectors")
 
     print(f"🎉 Ingestion complete: {total_chunks} total chunks indexed")
 
@@ -189,7 +182,8 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
         requests.delete(cache_url, timeout=10)
         print(f"🧹 Semantic cache cleared for {ticker}")
     except:
-        print("⚠️ Cache clear skipped")
+        # We expect a 404 if the endpoint isn't defined yet, which is fine
+        print("⚠️ Cache clear skipped (Endpoint might not exist yet)")
 
 if __name__ == "__main__":
     run_ingestion()

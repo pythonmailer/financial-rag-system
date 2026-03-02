@@ -6,7 +6,6 @@ import hashlib
 import numpy as np
 import asyncio
 import contextvars
-import socket
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -20,22 +19,18 @@ from sqlalchemy.orm import Session
 load_dotenv()
 
 # ==========================================
-# 🤖 SMART AUTO-DETECTION
+# 🌐 HARDCODED INFRASTRUCTURE CONFIG
 # ==========================================
-def resolve_host(service_name, default="localhost"):
-    try:
-        socket.gethostbyname(service_name)
-        return service_name
-    except socket.gaierror:
-        return default
+# Using your provided AWS Elastic IP for hosted services
+AWS_IP = "13.232.197.229"
 
-def get_service_url(service_name, port, protocol="http"):
-    host = resolve_host(service_name, "localhost")
-    return f"{protocol}://{host}:{port}"
+# We prefer the env vars from docker-compose, but fallback to your AWS IP
+QDRANT_URL = os.getenv("QDRANT_URL", f"http://{AWS_IP}:6333")
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"http://{AWS_IP}:5001")
 
-DB_HOST = resolve_host("postgres", "localhost")
-QDRANT_URL = os.getenv("QDRANT_URL", get_service_url("qdrant", 6333))
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", get_service_url("mlflow", 5001))
+# Database usually stays local to the container network in docker-compose
+# but we can fallback to the AWS IP if needed.
+DB_URL = os.getenv("DATABASE_URL", f"postgresql://admin:adminpassword@{AWS_IP}:5432/financial_rag")
 
 from database import SessionLocal, CacheEntry, FeedbackEntry
 
@@ -98,6 +93,7 @@ def get_reranker():
     if TESTING: return None
     import torch
     device = "mps" if torch.backends.mps.is_available() else "cpu"
+    # Fallback to CPU if on AWS without GPU
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
 
 @lru_cache()
@@ -176,7 +172,6 @@ def embed_query_batch(queries):
     return get_embedder().encode(queries).tolist()
 
 async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
-    # Span Type: LLM
     with start_span(name="LLM_Generation", span_type=SpanType.LLM) as span:
         if TESTING: return "Mock answer.", "Mock"
         msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
@@ -199,10 +194,9 @@ if not TESTING:
         return await asyncio.wait_for(client.chat.completions.create(model=model_name, messages=messages, temperature=0.2), timeout=12)
 
 # ==========================================
-# PROCESS (CHRONOLOGICAL STEP-BY-STEP TRACING)
+# PROCESS PIPELINE
 # ==========================================
 async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time):
-    # Root Parent Span for the entire RAG lifecycle
     with start_span(name=f"RAG-Workflow-{req.ticker}") as root_span:
         async with llm_semaphore:
             try:
@@ -212,10 +206,9 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                 # --- STEP 1: ROUTER ---
                 with start_span(name="1_Query_Routing", span_type=SpanType.TOOL) as span:
                     complexity = route_query(req.query)
-                    span.set_attribute("complexity", complexity)
                     span.set_outputs({"routing_result": complexity})
 
-                # --- STEP 2: RETRIEVAL (RETRIEVER type) ---
+                # --- STEP 2: RETRIEVAL ---
                 with start_span(name="2_Vector_Retrieval", span_type=SpanType.RETRIEVER) as span:
                     t_start = time.time()
                     search = await asyncio.to_thread(retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type)
@@ -223,14 +216,13 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                     
                     texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
                     span.set_attribute("qdrant_latency_ms", q_latency)
-                    span.set_attribute("chunks_found", len(texts))
                     span.set_outputs({"retrieved_count": len(texts)})
 
                 if not texts:
                     combined, sources = "No context found.", []
                     rerank_ms = 0
                 else:
-                    # --- STEP 3: RERANKING (TOOL type) ---
+                    # --- STEP 3: RERANKING ---
                     with start_span(name="3_Reranking", span_type=SpanType.TOOL) as span:
                         t_rerank = time.time()
                         idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
@@ -238,21 +230,14 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
                         
                         combined = "\n\n".join([texts[j] for j in idx])
                         sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
-                        
-                        span.set_attribute("rerank_latency_ms", rerank_ms)
                         span.set_outputs({"reranked_top_k": len(idx)})
 
                 # --- STEP 4: LLM GENERATION ---
                 answer, provider = await generate_answer(f"Analyst context:\n{combined}", req.query, complexity)
 
-                # Set Final Output on Root Span
                 if root_span:
-                    root_span.set_outputs({
-                        "final_answer": answer,
-                        "provider": provider
-                    })
+                    root_span.set_outputs({"final_answer": answer, "provider": provider})
 
-                # Log performance metrics for charts
                 if not TESTING:
                     mlflow.log_metric("qdrant_ms", q_latency)
                     mlflow.log_metric("rerank_ms", rerank_ms)
@@ -280,7 +265,6 @@ async def batch_processor():
 
         queries = [item[1].query for item in batch]
         with start_span(name="Batch_Embedding", span_type=SpanType.TOOL) as span:
-            if span: span.set_attribute("batch_size", len(queries))
             vectors = await asyncio.to_thread(embed_query_batch, queries)
 
         for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
@@ -298,8 +282,9 @@ async def lifespan(app: FastAPI):
             mlflow.set_tracking_uri(MLFLOW_URI)
             mlflow.set_experiment("Financial-RAG")
             mlflow.openai.autolog(log_traces=True)
-            print(f"✅ MLflow connected: {MLFLOW_URI}")
-        except: print("⚠️ MLflow Offline")
+            print(f"🚀 MLflow Connected to: {MLFLOW_URI}")
+        except Exception as e: 
+            print(f"⚠️ MLflow Connection Failed: {e}")
     task = asyncio.create_task(batch_processor())
     yield
     task.cancel()
@@ -316,7 +301,6 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     await request_queue.put((fut, req, q_hash, ctx, time.time()))
 
     if not TESTING:
-        # Start a Run in MLflow to group the following traces
         with mlflow.start_run(run_name=f"Request-{req.ticker}", nested=True):
             return await asyncio.wait_for(fut, timeout=90)
     return await asyncio.wait_for(fut, timeout=90)
@@ -324,9 +308,11 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
 @app.get("/ready")
 def ready():
     try:
+        # Check Qdrant Connection
         get_qdrant().get_collections()
         return {"status": "ready"}
-    except: return {"status": "not_ready"}
+    except Exception as e: 
+        return {"status": "not_ready", "error": str(e)}
 
 @app.post("/embed")
 async def embed(req: EmbedRequest):

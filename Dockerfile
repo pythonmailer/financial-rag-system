@@ -29,8 +29,9 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 # 5. Pre-download the Embedding Model (CRITICAL for AWS)
 # This prevents the backend from timing out on the first request while trying to download the model
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
-
+RUN python -c "from sentence_transformers import SentenceTransformer, CrossEncoder; \
+    SentenceTransformer('BAAI/bge-small-en-v1.5'); \
+    CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
 # 6. Copy the rest of the application code
 COPY . .
 

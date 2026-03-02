@@ -1,6 +1,5 @@
 import os
 import time
-import socket
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
@@ -10,44 +9,30 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
 # ==========================================
-# 🤖 SMART AUTO-DETECTION LOGIC
+# 🌐 HARDCODED INFRASTRUCTURE CONFIG
 # ==========================================
-def resolve_host(service_name, default="localhost"):
-    """
-    Checks if we can see the Docker service name. 
-    If not, we are likely running locally on a Mac.
-    """
-    try:
-        socket.gethostbyname(service_name)
-        return service_name
-    except socket.gaierror:
-        return default
+# Using your provided AWS Elastic IP directly
+AWS_IP = "13.232.197.229"
 
-# Detect correct hosts for the current environment
-DB_HOST = resolve_host("postgres", "localhost")
-QDRANT_HOST = resolve_host("qdrant", "localhost")
+# We prioritize environment variables (from .env or docker-compose)
+# but fallback to your static AWS IP.
+QDRANT_URL = os.getenv("QDRANT_URL", f"http://{AWS_IP}:6333")
+DATABASE_URL = os.getenv("DATABASE_URL", f"postgresql://admin:adminpassword@{AWS_IP}:5432/financial_rag")
+
+COLLECTION_NAME = "financial_documents"
+VECTOR_SIZE = 384  # must match BGE embedding model
 
 # ==========================================
 # CONFIG
 # ==========================================
 TESTING = os.getenv("TESTING", "False") == "True"
 
-# Use the auto-detected DB_HOST if DATABASE_URL is not explicitly set in .env
-DEFAULT_DB_URL = f"postgresql://admin:adminpassword@{DB_HOST}:5432/financial_rag"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
-
-# Use the auto-detected QDRANT_HOST
-QDRANT_URL = os.getenv("QDRANT_URL", f"http://{QDRANT_HOST}:6333")
-
-COLLECTION_NAME = "financial_documents"
-VECTOR_SIZE = 384  # must match BGE embedding model
-
 # ==========================================
 # SQLALCHEMY ENGINE
 # ==========================================
 if TESTING:
     engine = create_engine(
-        os.getenv("DATABASE_URL", "sqlite:///./test_database.db"),
+        "sqlite:///./test_database.db",
         connect_args={"check_same_thread": False},
     )
 else:
@@ -96,7 +81,7 @@ def init_db():
 
     try:
         Base.metadata.create_all(bind=engine)
-        print(f"✅ DB connection verified on host: {DB_HOST}")
+        print(f"✅ DB connection verified at: {DATABASE_URL.split('@')[-1]}")
     except Exception as e:
         print(f"⚠️ DB init skipped (likely using Alembic): {e}")
 
@@ -105,7 +90,7 @@ def init_db():
 # ==========================================
 def init_qdrant():
     if TESTING:
-        print("⏭️ Skipping Qdrant init (TESTING=True).")
+        print("跑 Skipping Qdrant init (TESTING=True).")
         return
 
     retries = 5
