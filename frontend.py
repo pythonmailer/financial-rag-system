@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import os
 import time
-import math  # Required for Sigmoid normalization
+import math
 
 # ==========================================
 # 1. CONFIGURATION & THEMING
@@ -13,32 +13,29 @@ st.set_page_config(
     layout="wide"
 )
 
-# Use fixed AAPL for the "Resume Edition"
 FIXED_TICKER = "AAPL"
 BACKEND_HOST = os.getenv("BACKEND_URL", "http://localhost:8001")
 ASK_URL = f"{BACKEND_HOST}/ask"
 FEEDBACK_URL = f"{BACKEND_HOST}/feedback"
 HEALTH_URL = f"{BACKEND_HOST}/ready"
 
-# Custom CSS for a cleaner "Apple-esque" look
 st.markdown("""
-    <style>
-    .stApp { background-color: #ffffff; }
-    .stChatMessage { border-radius: 15px; }
-    .stButton>button { border-radius: 20px; }
-    </style>
-    """, unsafe_with_html=True)
+<style>
+.stApp { background-color: #ffffff; }
+.stChatMessage { border-radius: 15px; }
+.stButton>button { border-radius: 20px; }
+</style>
+""", unsafe_allow_html=True)
 
 # ==========================================
-# 2. SIDEBAR (System Metadata)
+# 2. SIDEBAR
 # ==========================================
 with st.sidebar:
     st.title("🍎 Apple Intelligence")
     st.caption("Specialized Financial RAG Engine")
-    
+
     st.divider()
-    
-    # System Status Indicator
+
     try:
         r = requests.get(HEALTH_URL, timeout=2)
         if r.status_code == 200:
@@ -49,13 +46,18 @@ with st.sidebar:
         st.error("● Core Engine: Offline")
 
     st.markdown("### 🛠️ Model Settings")
-    top_k = st.slider("Retrieval Depth (Top-K)", 1, 10, 5, help="Number of SEC filing chunks retrieved per query.")
-    
-    st.info(f"**Target:** {FIXED_TICKER} (Apple Inc.)\n\n**Data:** FY2023-2024 10-K/Q Filings")
+    top_k = st.slider(
+        "Retrieval Depth (Top-K)", 1, 10, 5,
+        help="Number of SEC filing chunks retrieved per query."
+    )
+
+    st.info(
+        f"**Target:** {FIXED_TICKER} (Apple Inc.)\n\n"
+        "**Data:** FY2023-2024 10-K/Q Filings"
+    )
 
     st.divider()
-    
-    # Resume Highlight Section
+
     with st.expander("🚀 Tech Highlights"):
         st.write("- **Hybrid RAG:** Groq/Gemini LPU inference.")
         st.write("- **Vector DB:** Qdrant with Metadata Filtering.")
@@ -67,16 +69,20 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 3. MAIN UI HEADER
+# 3. HEADER
 # ==========================================
 st.title("🍎 Apple Financial Analyst")
-st.markdown(f"""
-    This system provides high-precision answers based strictly on **Apple Inc. ({FIXED_TICKER})** SEC filings. 
-    It leverages semantic search to bypass the noise of standard LLMs.
-""")
+st.markdown(
+    f"""
+This system provides high-precision answers based strictly on  
+**Apple Inc. ({FIXED_TICKER})** SEC filings.
+
+It leverages semantic search to bypass the noise of standard LLMs.
+"""
+)
 
 # ==========================================
-# 4. CHAT INTERFACE
+# 4. CHAT STATE
 # ==========================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -85,7 +91,31 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk factors..."):
+# ==========================================
+# 5. HELPER: SAFE SCORE NORMALIZATION
+# ==========================================
+def normalize_score(raw_score):
+    try:
+        raw_score = float(raw_score)
+    except:
+        raw_score = 0.0
+
+    if math.isnan(raw_score) or math.isinf(raw_score):
+        raw_score = 0.0
+
+    # Prevent sigmoid overflow
+    raw_score = max(min(raw_score, 10), -10)
+
+    norm_score = 1 / (1 + math.exp(-raw_score))
+
+    return max(0.0, min(1.0, norm_score))
+
+# ==========================================
+# 6. CHAT INPUT
+# ==========================================
+if prompt := st.chat_input(
+    "Ask about Apple's Q3 revenue, R&D growth, or risk factors..."
+):
 
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -106,12 +136,15 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
 
                 if response.status_code == 200:
                     data = response.json()
+
                     answer = data.get("answer", "No analysis available.")
                     is_cached = data.get("cached", False)
                     provider = data.get("provider", "LLM")
                     sources = data.get("sources", [])
 
+                    # ======================
                     # Typing effect
+                    # ======================
                     full_text = ""
                     for word in answer.split():
                         full_text += word + " "
@@ -119,38 +152,52 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
                         time.sleep(0.008)
                     message_placeholder.markdown(full_text)
 
-                    # Performance Metadata
+                    # ======================
+                    # Metadata Row
+                    # ======================
                     cols = st.columns(3)
+
                     with cols[0]:
                         if is_cached:
                             st.caption("⚡ **Source:** Semantic Cache (Postgres)")
                         else:
                             st.caption(f"🤖 **Inference:** {provider}")
-                    
-                    # Source Citation Expander (FIXED FOR RERANKER LOGITS)
+
+                    with cols[1]:
+                        st.caption(f"📊 **Chunks Retrieved:** {len(sources)}")
+
+                    # Optional latency display if backend sends it later
+                    with cols[2]:
+                        latency = data.get("llm_ms")
+                        if latency:
+                            st.caption(f"⏱️ **LLM:** {latency:.0f} ms")
+
+                    # ======================
+                    # Source Evidence
+                    # ======================
                     if sources:
                         with st.expander("📚 View Document Evidence"):
                             for i, src in enumerate(sources):
-                                # Logic to handle raw Cross-Encoder scores
-                                raw_score = float(src.get("score", 0.0))
-                                
-                                # Sigmoid normalization to 0.0 - 1.0 range
-                                # 1 / (1 + e^-x)
-                                norm_score = 1 / (1 + math.exp(-raw_score))
-                                
-                                # Final clipping for Streamlit safety
-                                final_score = max(0.0, min(1.0, norm_score))
+                                score = normalize_score(src.get("score", 0.0))
 
-                                st.markdown(f"**Chunk {i+1}** | Relevancy: `{final_score:.2%}`")
-                                st.progress(final_score) 
+                                st.markdown(
+                                    f"**Chunk {i+1}** | Relevancy: `{score:.2%}`"
+                                )
+                                st.progress(score)
                                 st.caption(src.get("text", "")[:400] + "...")
                                 st.divider()
 
                 else:
-                    st.error(f"Analysis failed. Backend returned: {response.status_code}")
+                    st.error(
+                        f"Analysis failed. Backend returned: {response.status_code}"
+                    )
 
             except Exception as e:
-                st.error(f"Connection Error: Ensure your EC2 endpoint is accessible. ({e})")
+                st.error(
+                    f"Connection Error: Ensure your EC2 endpoint is accessible. ({e})"
+                )
 
-    if 'answer' in locals():
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+    if "answer" in locals():
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer}
+        )

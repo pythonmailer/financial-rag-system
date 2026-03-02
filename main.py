@@ -36,8 +36,7 @@ if not TESTING:
     from qdrant_client.http import models
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
-    
-    # Map the real decorator
+
     trace = mlflow.trace
 else:
     SentenceTransformer = None
@@ -45,9 +44,7 @@ else:
     QdrantClient = None
     models = None
     AsyncOpenAI = None
-    retry = lambda *a, **k: (lambda f: f) # Mock retry for testing
-    
-    # Dummy decorator for testing environments
+    retry = lambda *a, **k: (lambda f: f)
     trace = lambda name=None, **kwargs: (lambda f: f)
 
 # ==========================================
@@ -58,7 +55,6 @@ async def lifespan(app: FastAPI):
     if not TESTING:
         try:
             mlflow.set_tracking_uri("http://mlflow:5001")
-            # Using a distinct experiment name so you can compare baselines easily
             mlflow.set_experiment("Financial-RAG-Sequential")
             mlflow.openai.autolog(log_traces=True)
             print("✅ MLflow initialized successfully.")
@@ -69,11 +65,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Financial RAG API - Sequential (Baseline)", lifespan=lifespan)
 
 if not TESTING:
-    # Instrument for MLflow/OpenTelemetry traces
     FastAPIInstrumentor.instrument_app(app)
 
 # ==========================================
-# LAZY LOADERS (Optimized for RAM usage)
+# LAZY LOADERS
 # ==========================================
 @lru_cache()
 def get_embedder():
@@ -93,7 +88,7 @@ def get_qdrant():
     return QdrantClient(url=QDRANT_URL)
 
 # ==========================================
-# DATABASE DEPENDENCY
+# DATABASE DEP
 # ==========================================
 def get_db():
     db = SessionLocal()
@@ -137,22 +132,17 @@ def ready():
 
 @app.get("/queue_status")
 def queue_status():
-    return {
-        "mode": "sequential",
-        "queue_size": 0
-    }
+    return {"mode": "sequential", "queue_size": 0}
 
 @app.post("/embed")
 def embed(req: EmbedRequest):
     if TESTING:
         return {"embeddings": [[0.0] * 384 for _ in req.texts]}
-
-    embedder = get_embedder()
-    vectors = embedder.encode(req.texts)
+    vectors = get_embedder().encode(req.texts)
     return {"embeddings": vectors.tolist()}
 
 # ==========================================
-# CIRCUIT BREAKER (Multi-Worker Safe)
+# CIRCUIT BREAKER
 # ==========================================
 class CircuitBreaker:
     def __init__(self, name="groq"):
@@ -164,7 +154,8 @@ class CircuitBreaker:
             with open(tmp, "w") as f:
                 json.dump(state, f)
             os.replace(tmp, self.file_path)
-        except: pass
+        except:
+            pass
 
     @property
     def is_healthy(self):
@@ -177,7 +168,8 @@ class CircuitBreaker:
                     return True
                 return False
             return True
-        except: return True
+        except:
+            return True
 
     def trip(self, cooldown=60):
         self._write({"healthy": False, "disabled_until": time.time() + cooldown})
@@ -188,7 +180,7 @@ class CircuitBreaker:
 groq_breaker = CircuitBreaker("groq")
 
 # ==========================================
-# LLM CLIENT (Production only)
+# LLM CLIENT
 # ==========================================
 if not TESTING:
     primary_client = AsyncOpenAI(
@@ -197,7 +189,7 @@ if not TESTING:
     )
 
 # ==========================================
-# RAG CORE LOGIC (Now Traced)
+# RAG CORE (TRACED)
 # ==========================================
 @trace(name="Embed_Query")
 def embed_query(query: str):
@@ -207,17 +199,13 @@ def embed_query(query: str):
 @trace(name="Qdrant_Vector_Search")
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if TESTING: return type("obj", (object,), {"points": []})
-    
     try:
-        qdrant = get_qdrant()
-
         must = [
             models.FieldCondition(
                 key="ticker",
                 match=models.MatchValue(value=ticker.upper())
             )
         ]
-
         if document_type:
             must.append(
                 models.FieldCondition(
@@ -226,13 +214,12 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
                 )
             )
 
-        return qdrant.query_points(
+        return get_qdrant().query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
             limit=limit,
             query_filter=models.Filter(must=must)
         )
-
     except Exception:
         return type("obj", (object,), {"points": []})
 
@@ -241,8 +228,7 @@ def rerank_documents(query, texts, top_k):
     if TESTING or not texts:
         return list(range(min(top_k, len(texts)))), np.zeros(len(texts))
 
-    reranker = get_reranker()
-    scores = reranker.predict([[query, t] for t in texts])
+    scores = get_reranker().predict([[query, t] for t in texts])
     idx = np.argsort(scores)[::-1][:top_k]
     return idx, scores
 
@@ -259,7 +245,7 @@ def save_to_cache(q_hash, user_query, llm_response, ticker, provider):
             )
         )
         db.commit()
-    except Exception:
+    except:
         db.rollback()
     finally:
         db.close()
@@ -292,7 +278,7 @@ async def generate_answer(system_prompt, user_query):
                 ],
             )
             return resp.choices[0].message.content, "Groq"
-        except Exception:
+        except:
             groq_breaker.trip()
 
     return "⚠️ LLM unavailable.", "System Degraded"
@@ -313,11 +299,20 @@ def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 # ==========================================
-# ASK (SEQUENTIAL BASELINE) - Root Trace
+# ASK (SEQUENTIAL BASELINE WITH ROOT SPAN)
 # ==========================================
 @app.post("/ask")
-@trace(name="Sequential_RAG_Pipeline")
 async def ask(req: QueryRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    if not TESTING:
+        with mlflow.start_span(name="ASK_Request"):
+            return await _ask_impl(req, background_tasks, db)
+    else:
+        return await _ask_impl(req, background_tasks, db)
+
+# ==========================================
+# IMPLEMENTATION
+# ==========================================
+async def _ask_impl(req: QueryRequest, background_tasks: BackgroundTasks, db: Session):
     q_hash = hashlib.sha256(
         f"{req.ticker}_{req.query.lower()}".encode()
     ).hexdigest()
@@ -335,19 +330,43 @@ async def ask(req: QueryRequest, background_tasks: BackgroundTasks, db: Session 
             "provider": "Cache",
         }
 
+    if not TESTING:
+        mlflow.set_tag("ticker", req.ticker)
+        mlflow.set_tag("top_k", req.top_k)
+
+    # EMBED
+    t0 = time.time()
     query_vector = embed_query(req.query)
+    if not TESTING:
+        mlflow.log_metric("embed_ms", (time.time() - t0) * 1000)
+
+    # RETRIEVE
+    t1 = time.time()
     search = retrieve_from_qdrant(query_vector, req.ticker, req.document_type)
+    if not TESTING:
+        mlflow.log_metric("qdrant_ms", (time.time() - t1) * 1000)
 
     texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
 
+    # RERANK
+    t2 = time.time()
     idx, scores = rerank_documents(req.query, texts, req.top_k)
+    if not TESTING:
+        mlflow.log_metric("rerank_ms", (time.time() - t2) * 1000)
+        mlflow.log_metric("retrieved_docs", len(texts))
+        mlflow.log_metric("reranked_docs", len(idx))
 
     context = "\n\n".join([texts[i] for i in idx]) if len(idx) else "No relevant context."
 
+    # LLM
+    t3 = time.time()
     answer, provider = await generate_answer(
         f"You are a Wall Street analyst. Use ONLY this context:\n{context}",
         req.query,
     )
+    if not TESTING:
+        mlflow.log_metric("llm_ms", (time.time() - t3) * 1000)
+        mlflow.set_tag("provider", provider)
 
     sources = [
         {"score": float(scores[i]), "text": texts[i], "document_type": "SEC Filing"}
