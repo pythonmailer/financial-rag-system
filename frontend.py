@@ -2,9 +2,31 @@ import streamlit as st
 import requests
 import os
 import math
+import socket
 
 # ==========================================
-# 1. CONFIGURATION & THEMING
+# 🤖 SMART AUTO-DETECTION (No Env Vars Needed)
+# ==========================================
+def resolve_backend_url():
+    """
+    On AWS: Resolves to the 'backend' container name.
+    On Mac: Fails resolution and falls back to localhost.
+    """
+    try:
+        # Check if we can see the 'backend' container (Docker Network)
+        socket.gethostbyname("backend")
+        return "http://backend:8001"
+    except socket.gaierror:
+        # We are running locally on the Mac Mini
+        return "http://localhost:8001"
+
+# Automatically set the URLs based on where we are standing
+BACKEND_HOST = resolve_backend_url()
+ASK_URL = f"{BACKEND_HOST}/ask"
+HEALTH_URL = f"{BACKEND_HOST}/ready"
+
+# ==========================================
+# 🎨 CHATGPT DARK DESIGN (FORCED)
 # ==========================================
 st.set_page_config(
     page_title="Apple Financial Intelligence",
@@ -12,46 +34,84 @@ st.set_page_config(
     layout="wide"
 )
 
-FIXED_TICKER = "AAPL"
-BACKEND_HOST = os.getenv("BACKEND_URL", "http://13.232.197.229:8001")
-ASK_URL = f"{BACKEND_HOST}/ask"
-HEALTH_URL = f"{BACKEND_HOST}/ready"
-
 st.markdown("""
 <style>
-.stApp { background-color: #ffffff; }
-.stChatMessage { border-radius: 15px; }
-.stButton>button { border-radius: 20px; }
+    .stApp { background-color: #0d0d0d !important; }
+    
+    /* Center the chat container */
+    .main .block-container {
+        max-width: 850px;
+        padding-top: 2rem;
+    }
+
+    /* Force White/Grey Text */
+    .stApp, .stMarkdown, p, h1, h2, h3, h4, span, label, .stCaption {
+        color: #ececec !important;
+        font-family: 'Inter', sans-serif;
+    }
+
+    /* ChatGPT Message Lines */
+    .stChatMessage { 
+        background-color: transparent !important;
+        border-radius: 0px; 
+        padding: 1.5rem 0rem;
+        border-bottom: 1px solid #2d2d2d;
+    }
+
+    /* Assistant Highlight */
+    [data-testid="stChatMessageAssistant"] {
+        background-color: #1a1a1a !important;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 10px;
+    }
+
+    /* Input Box */
+    .stChatInputContainer textarea {
+        background-color: #212121 !important;
+        color: white !important;
+        border: 1px solid #424242 !important;
+        border-radius: 14px !important;
+    }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background-color: #000000 !important;
+        border-right: 1px solid #2d2d2d;
+    }
+
+    /* Relevancy Progress Bar (OpenAI Green) */
+    .stProgress > div > div > div > div {
+        background-color: #10a37f !important;
+    }
+
+    #MainMenu, footer, header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. SIDEBAR
+# 2. SIDEBAR & STATE
 # ==========================================
+FIXED_TICKER = "AAPL"
+
 with st.sidebar:
     st.title("🍎 Apple Intelligence")
-    st.caption("Specialized Financial RAG Engine")
-
+    st.caption(f"Environment: {'AWS' if 'backend' in BACKEND_HOST else 'Local Mac'}")
+    
     st.divider()
 
     try:
+        # Check health of the auto-detected backend
         r = requests.get(HEALTH_URL, timeout=2)
-        if r.status_code == 200:
-            st.success("● Core Engine: Online")
-        else:
-            st.warning("● Core Engine: Initializing")
+        if r.status_code == 200: st.success("● Core Engine: Online")
+        else: st.warning("● Core Engine: Initializing")
     except:
         st.error("● Core Engine: Offline")
 
     st.markdown("### 🛠️ Model Settings")
-    top_k = st.slider("Retrieval Depth (Top-K)", 1, 10, 5)
+    top_k = st.slider("Retrieval Depth", 1, 10, 5)
 
-    st.info(
-        f"**Target:** {FIXED_TICKER} (Apple Inc.)\n\n"
-        "**Data:** FY2023-2024 10-K/Q Filings"
-    )
-
-    if st.button("🧹 Clear Analysis History", use_container_width=True):
+    if st.button("🧹 Clear Conversation", use_container_width=True):
         st.session_state.messages = []
         st.session_state.streaming_done = False
         st.session_state.answer_saved = False
@@ -59,145 +119,79 @@ with st.sidebar:
         st.session_state.last_sources = []
         st.rerun()
 
+# Init Session State
+for key, default in {
+    "messages": [], "streaming_done": False, "answer_saved": False,
+    "last_answer": None, "last_sources": [], "last_provider": None, "last_cached": False,
+}.items():
+    if key not in st.session_state: st.session_state[key] = default
+
 # ==========================================
-# 3. HEADER
+# 3. CHAT INTERFACE
 # ==========================================
 st.title("🍎 Apple Financial Analyst")
-st.markdown(
-    f"""
-This system provides high-precision answers based strictly on  
-**Apple Inc. ({FIXED_TICKER})** SEC filings.
-"""
-)
 
-# ==========================================
-# 4. SESSION STATE INIT
-# ==========================================
-for key, default in {
-    "messages": [],
-    "streaming_done": False,
-    "answer_saved": False,
-    "last_answer": None,
-    "last_sources": [],
-    "last_provider": None,
-    "last_cached": False,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-# ==========================================
-# 5. RENDER CHAT HISTORY
-# ==========================================
+# Render History
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# ==========================================
-# 6. SAFE SCORE NORMALIZATION
-# ==========================================
 def normalize_score(raw_score):
     try:
         raw_score = float(raw_score)
-    except:
-        raw_score = 0.0
+        raw_score = max(min(raw_score, 10), -10)
+        return 1 / (1 + math.exp(-raw_score))
+    except: return 0.0
 
-    if math.isnan(raw_score) or math.isinf(raw_score):
-        raw_score = 0.0
+# Input Logic
+if prompt := st.chat_input("Ask about Apple's margins, iPhone sales, or net income..."):
 
-    # Prevent math overflow by capping extreme values
-    raw_score = max(min(raw_score, 10), -10)
-    
-    # Sigmoid function: turns logits (like 5.24) into percentages (like 0.99)
-    norm_score = 1 / (1 + math.exp(-raw_score))
-    return max(0.0, min(1.0, norm_score))
-
-
-# ==========================================
-# 7. CHAT INPUT
-# ==========================================
-if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
-
-    # Reset state for new prompt
     st.session_state.streaming_done = False
     st.session_state.answer_saved = False
-    st.session_state.last_answer = None
-    st.session_state.last_sources = []
 
     with st.chat_message("user"):
         st.markdown(prompt)
-
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        # ======================
-        # RUN ONLY ONCE
-        # ======================
         if not st.session_state.streaming_done:
-
             response = None
-            with st.spinner("Retrieving SEC Filings & Generating Analysis..."):
+            with st.spinner(""):
                 try:
                     payload = {"query": prompt, "ticker": FIXED_TICKER, "top_k": top_k}
                     response = requests.post(ASK_URL, json=payload, timeout=90)
                 except Exception as e:
                     st.error(f"Connection Error: {e}")
 
-            # 🛑 EXECUTE OUTSIDE THE SPINNER
-            if response is not None and response.status_code == 200:
+            if response and response.status_code == 200:
                 data = response.json()
-
-                answer = data.get("answer", "No analysis available.")
+                answer = data.get("answer", "").replace("$", r"\$")
                 
-                # Stop Streamlit from turning money into green LaTeX math equations
-                answer = answer.replace("$", r"\$")
-                
-                sources = data.get("sources", [])
-                provider = data.get("provider", "LLM")
-                is_cached = data.get("cached", False)
-
-                # SAVE STATE
+                # Save results to state
                 st.session_state.last_answer = answer
-                st.session_state.last_sources = sources
-                st.session_state.last_provider = provider
-                st.session_state.last_cached = is_cached
+                st.session_state.last_sources = data.get("sources", [])
+                st.session_state.last_provider = data.get("provider", "LLM")
+                st.session_state.last_cached = data.get("cached", False)
 
-                # 🚨 THE FIX: Display text instantly instead of streaming
                 st.markdown(answer)
                 st.session_state.streaming_done = True
+            elif response:
+                st.error(f"Error: {response.status_code}")
 
-            elif response is not None:
-                st.error(f"Analysis failed. Backend returned: {response.status_code}")
-
-        else:
-            # Rerun path → show final instantly
-            st.markdown(st.session_state.last_answer or "")
-
-    # ======================================
-    # METADATA ROW (PERSISTENT)
-    # ======================================
+    # Metadata & Evidence Row
     if st.session_state.last_answer:
-        cols = st.columns(3)
+        st.caption(f"🤖 **Model:** {st.session_state.last_provider} | {'⚡ Cached' if st.session_state.last_cached else '🌐 Live'}")
+        
+        if st.session_state.last_sources:
+            with st.expander("📚 View SEC Filing Evidence"):
+                for i, src in enumerate(st.session_state.last_sources):
+                    score = normalize_score(src.get("score", 0.0))
+                    st.markdown(f"**Source {i+1}** | Relevancy: `{score:.1%}`")
+                    st.progress(score)
+                    st.caption(src.get("text", "")[:400] + "...")
+                    st.divider()
 
-        with cols[0]:
-            if st.session_state.last_cached:
-                st.caption("⚡ **Source:** Semantic Cache")
-            else:
-                st.caption(f"🤖 **Inference:** {st.session_state.last_provider}")
-
-        with cols[1]:
-            st.caption(f"📊 **Chunks Retrieved:** {len(st.session_state.last_sources)}")
-
-    # ======================================
-    # SOURCE EVIDENCE
-    # ======================================
-    if st.session_state.last_sources:
-        with st.expander("📚 View Document Evidence"):
-            for i, src in enumerate(st.session_state.last_sources):
-                
-                # 1. Get raw cross-encoder score safely
-                try:
-                    raw_score = float(src.get("score", 0.0))
-                except (ValueError, TypeError):
-                    raw_score = 0.0
-
-                # 2. Hard Sigmoid clamping (Forces any number
+    # Save Assistant Message to history
+    if st.session_state.streaming_done and not st.session_state.answer_saved:
+        st.session_state.messages.append({"role": "assistant", "content": st.session_state.last_answer})
+        st.session_state.answer_saved = True

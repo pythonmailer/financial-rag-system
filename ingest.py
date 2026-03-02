@@ -3,7 +3,9 @@ import uuid
 import hashlib
 import requests
 import time
-from datetime import datetime
+import socket
+import math
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from sec_edgar_downloader import Downloader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -11,25 +13,41 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, Distance, VectorParams
 
 # ==========================================
+# 🤖 SMART AUTO-DETECTION
+# ==========================================
+def resolve_host(service_name, default="localhost"):
+    try:
+        socket.gethostbyname(service_name)
+        return service_name
+    except socket.gaierror:
+        return default
+
+# Detect hosts
+QDRANT_HOST_NAME = resolve_host("qdrant", "localhost")
+BACKEND_HOST_NAME = resolve_host("backend", "localhost")
+
+# ==========================================
 # CONFIG
 # ==========================================
-QDRANT_HOST = os.getenv("QDRANT_URL", "http://localhost:6333")
-BACKEND_HOST = os.getenv("BACKEND_URL", "http://localhost:8001")
+QDRANT_URL = os.getenv("QDRANT_URL", f"http://{QDRANT_HOST_NAME}:6333")
+BACKEND_URL = os.getenv("BACKEND_URL", f"http://{BACKEND_HOST_NAME}:8001")
 COLLECTION_NAME = "financial_documents"
 
-EMBED_URL = f"{BACKEND_HOST}/embed"
-READY_URL = f"{BACKEND_HOST}/ready"
+EMBED_URL = f"{BACKEND_URL}/embed"
+READY_URL = f"{BACKEND_URL}/ready"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 BATCH_SIZE = 64  # batch embedding size
+
+print(f"🛠️ Configured Ingestor: Backend @ {BACKEND_URL} | Qdrant @ {QDRANT_URL}")
 
 # ==========================================
 # WAIT FOR BACKEND
 # ==========================================
 def wait_for_backend():
     print("⏳ Waiting for backend readiness...")
-    for _ in range(60):
+    for i in range(30):
         try:
             r = requests.get(READY_URL, timeout=3)
             if r.status_code == 200 and r.json().get("status") == "ready":
@@ -37,20 +55,26 @@ def wait_for_backend():
                 return
         except:
             pass
+        print(f"   (Retrying... {i+1}/30)")
         time.sleep(2)
-    raise RuntimeError("❌ Backend not ready after waiting")
+    raise RuntimeError(f"❌ Backend at {BACKEND_URL} not ready")
 
 # ==========================================
 # EMBED VIA BACKEND (BATCHED)
 # ==========================================
 def embed_chunks(chunks):
     embeddings = []
-
+    print(f"🧠 Embedding {len(chunks)} chunks...")
+    
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i : i + BATCH_SIZE]
-        r = requests.post(EMBED_URL, json={"texts": batch}, timeout=120)
-        r.raise_for_status()
-        embeddings.extend(r.json()["embeddings"])
+        try:
+            r = requests.post(EMBED_URL, json={"texts": batch}, timeout=120)
+            r.raise_for_status()
+            embeddings.extend(r.json()["embeddings"])
+        except Exception as e:
+            print(f"❌ Embedding failed: {e}")
+            raise
 
     return embeddings
 
@@ -70,11 +94,11 @@ def chunk_text(text):
 # ==========================================
 def ensure_collection(qdrant):
     if not qdrant.collection_exists(COLLECTION_NAME):
-        print("🧱 Creating Qdrant collection...")
+        print(f"🧱 Creating Qdrant collection: {COLLECTION_NAME}")
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(
-                size=384,  # must match embedding model
+                size=384,  # must match BGE embedding model
                 distance=Distance.COSINE,
             ),
         )
@@ -96,10 +120,11 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
 
     wait_for_backend()
 
-    qdrant = QdrantClient(url=QDRANT_HOST)
+    qdrant = QdrantClient(url=QDRANT_URL)
     ensure_collection(qdrant)
 
-    dl = Downloader("FinancialRAGProject", "your_email@example.com", "./sec_data")
+    # Use a generic name and your real email as required by SEC
+    dl = Downloader("FinancialRAGProject", "chiragg948@gmail.com", "./sec_data")
 
     total_chunks = 0
 
@@ -111,6 +136,7 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
 
         for root, _, files in os.walk(base_path):
             for file in files:
+                # SEC often names the main file 'primary_document.html'
                 if file.endswith(".html") or file == "primary_document.html":
                     html_path = os.path.join(root, file)
                     print(f"📄 Processing {html_path}")
@@ -118,15 +144,16 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
                     text = extract_text_from_html(html_path)
                     chunks = chunk_text(text)
 
-                    print(f"🧠 Chunked into {len(chunks)} segments")
+                    print(f"✂️ Created {len(chunks)} segments")
 
                     embeddings = embed_chunks(chunks)
 
                     points = []
 
                     for chunk, vector in zip(chunks, embeddings):
+                        # Unique ID based on content to prevent duplicates
                         chunk_hash = hashlib.md5(
-                            f"{ticker}_{f_type}_{chunk}".encode()
+                            f"{ticker}_{f_type}_{chunk[:100]}".encode()
                         ).hexdigest()
 
                         points.append(
@@ -138,38 +165,31 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
                                     "document_type": f_type.upper(),
                                     "text": chunk,
                                     "source_file": file,
-                                    "ingested_at": datetime.utcnow().isoformat(),
+                                    "ingested_at": datetime.now(timezone.utc).isoformat(),
                                 },
                             )
                         )
 
+                    # Bulk upsert to Qdrant
                     qdrant.upsert(
                         collection_name=COLLECTION_NAME,
                         points=points,
                     )
 
                     total_chunks += len(points)
-                    print(f"✅ Upserted {len(points)} vectors")
+                    print(f"✅ Upserted {len(points)} vectors to Qdrant")
 
-    print(f"🎉 Ingestion complete: {total_chunks} total chunks")
+    print(f"🎉 Ingestion complete: {total_chunks} total chunks indexed")
 
     # ======================================
     # CACHE INVALIDATION
     # ======================================
     try:
-        cache_url = f"{BACKEND_HOST}/cache/clear/{ticker}"
-        r = requests.delete(cache_url, timeout=10)
+        cache_url = f"{BACKEND_URL}/cache/clear/{ticker}"
+        requests.delete(cache_url, timeout=10)
+        print(f"🧹 Semantic cache cleared for {ticker}")
+    except:
+        print("⚠️ Cache clear skipped")
 
-        if r.status_code == 200:
-            cleared = r.json().get("cleared_entries", 0)
-            print(f"🧹 Cleared {cleared} cache entries for {ticker}")
-        else:
-            print(f"⚠️ Cache clear returned {r.status_code}")
-    except Exception as e:
-        print(f"⚠️ Cache clear skipped: {e}")
-
-# ==========================================
-# ENTRYPOINT
-# ==========================================
 if __name__ == "__main__":
     run_ingestion()

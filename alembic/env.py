@@ -6,6 +6,8 @@ from alembic import context
 
 # Import your SQLAlchemy Base
 from database import Base
+from dotenv import load_dotenv
+load_dotenv()
 
 # Alembic Config object
 config = context.config
@@ -13,7 +15,7 @@ config = context.config
 # ==========================================
 # 🔑 Override DB URL from ENV (if provided)
 # ==========================================
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:adminpassword@postgres:5432/financial_rag")
 if DATABASE_URL:
     config.set_main_option("sqlalchemy.url", DATABASE_URL)
 

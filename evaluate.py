@@ -1,18 +1,35 @@
 import time
 import math
+import socket
+import os
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 # ==========================================
+# 🤖 SMART AUTO-DETECTION (No IP Needed)
+# ==========================================
+def resolve_qdrant_url():
+    """
+    On AWS: Resolves to the 'qdrant' container name.
+    On Mac: Fails resolution and falls back to localhost.
+    """
+    try:
+        # Check if we can see the 'qdrant' container (Docker Network)
+        socket.gethostbyname("qdrant")
+        return "http://qdrant:6333"
+    except socket.gaierror:
+        # We are running locally on the Mac Mini
+        return "http://localhost:6333"
+
+# Automatically set the URL based on where we are standing
+QDRANT_URL = os.getenv("QDRANT_URL", resolve_qdrant_url())
+
+# ==========================================
 # 1. INITIALIZATION
 # ==========================================
-print("🚀 Initializing Evaluation Suite...")
+print(f"🚀 Initializing Evaluation Suite on: {QDRANT_URL}")
 model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# UPDATE THIS: Use 'localhost' if running on the EC2 itself, 
-# or your EC2 Public IP (e.g., 'http://13.232.197.229:6333') if running from your laptop.
-QDRANT_URL = "http://13.232.197.229:6333" 
 qdrant = QdrantClient(url=QDRANT_URL)
 
 # ==========================================
@@ -56,6 +73,15 @@ def run_evaluation(k=5):
     hits = 0
     reciprocal_ranks = []
     total_latency = 0
+
+    # Ensure collection exists before evaluating
+    try:
+        if not qdrant.collection_exists("financial_documents"):
+            print("❌ ERROR: 'financial_documents' collection not found in Qdrant!")
+            return
+    except Exception as e:
+        print(f"❌ CONNECTION ERROR: Could not reach Qdrant at {QDRANT_URL}: {e}")
+        return
 
     for item in EVAL_DATASET:
         start_time = time.time()

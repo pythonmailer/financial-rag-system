@@ -1,5 +1,6 @@
 import os
 import time
+import socket
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
@@ -9,14 +10,35 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
 # ==========================================
+# 🤖 SMART AUTO-DETECTION LOGIC
+# ==========================================
+def resolve_host(service_name, default="localhost"):
+    """
+    Checks if we can see the Docker service name. 
+    If not, we are likely running locally on a Mac.
+    """
+    try:
+        socket.gethostbyname(service_name)
+        return service_name
+    except socket.gaierror:
+        return default
+
+# Detect correct hosts for the current environment
+DB_HOST = resolve_host("postgres", "localhost")
+QDRANT_HOST = resolve_host("qdrant", "localhost")
+
+# ==========================================
 # CONFIG
 # ==========================================
 TESTING = os.getenv("TESTING", "False") == "True"
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://admin:adminpassword@postgres:5432/financial_rag",
-)
-QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+
+# Use the auto-detected DB_HOST if DATABASE_URL is not explicitly set in .env
+DEFAULT_DB_URL = f"postgresql://admin:adminpassword@{DB_HOST}:5432/financial_rag"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+
+# Use the auto-detected QDRANT_HOST
+QDRANT_URL = os.getenv("QDRANT_URL", f"http://{QDRANT_HOST}:6333")
+
 COLLECTION_NAME = "financial_documents"
 VECTOR_SIZE = 384  # must match BGE embedding model
 
@@ -29,6 +51,7 @@ if TESTING:
         connect_args={"check_same_thread": False},
     )
 else:
+    # pool_pre_ping=True is vital for AWS to handle dropped connections
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
@@ -63,15 +86,9 @@ class CacheEntry(Base):
     provider = Column(String, nullable=True)
 
 # ==========================================
-# DB INIT (ONLY FOR TESTING OR FIRST BOOT WITHOUT ALEMBIC)
+# DB INIT
 # ==========================================
 def init_db():
-    """
-    In production with Alembic, tables are created via migrations.
-    This function is safe for:
-    - TESTING=True
-    - First boot fallback (if Alembic not used)
-    """
     if TESTING:
         Base.metadata.create_all(bind=engine)
         print("✅ SQLite test database initialized.")
@@ -79,18 +96,14 @@ def init_db():
 
     try:
         Base.metadata.create_all(bind=engine)
-        print("✅ Tables verified (fallback mode).")
+        print(f"✅ DB connection verified on host: {DB_HOST}")
     except Exception as e:
-        print(f"⚠️ DB init skipped: {e}")
+        print(f"⚠️ DB init skipped (likely using Alembic): {e}")
 
 # ==========================================
 # QDRANT INIT
 # ==========================================
 def init_qdrant():
-    """
-    Ensures Qdrant collection exists.
-    Safe to call multiple times.
-    """
     if TESTING:
         print("⏭️ Skipping Qdrant init (TESTING=True).")
         return
@@ -110,19 +123,19 @@ def init_qdrant():
                         distance=Distance.COSINE,
                     ),
                 )
-                print(f"✅ Qdrant collection '{COLLECTION_NAME}' created.")
+                print(f"✅ Qdrant collection '{COLLECTION_NAME}' created at {QDRANT_URL}")
             else:
-                print(f"✅ Qdrant collection '{COLLECTION_NAME}' exists.")
+                print(f"✅ Qdrant collection '{COLLECTION_NAME}' exists at {QDRANT_URL}")
 
             return
 
         except Exception as e:
             print(
-                f"⏳ Waiting for Qdrant... ({attempt}/{retries}) → {str(e)[:120]}"
+                f"⏳ Waiting for Qdrant at {QDRANT_URL}... ({attempt}/{retries})"
             )
             time.sleep(delay)
 
-    print("❌ CRITICAL: Could not connect to Qdrant after retries.")
+    print("❌ CRITICAL: Could not connect to Qdrant.")
 
 # ==========================================
 # SAFE STARTUP HOOKS
