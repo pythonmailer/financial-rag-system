@@ -28,7 +28,7 @@ services:
       retries: 5
       start_period: 15s
 
-  mlflow:  # <--- WAS INDENTED WRONG, NOW FIXED
+  mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow_server
     command: >
@@ -60,8 +60,12 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       HF_TOKEN: ${HF_TOKEN}
       DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
-      TESTING: "False"
       QDRANT_URL: http://qdrant:6333
+      # --- ADDED FOR MLFLOW TRACKING ---
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      MLFLOW_EXPERIMENT_NAME: "Apple_Financial_RAG"
+      # --------------------------------
+      TESTING: "False"
       PYTHONPATH: /app
       USE_GPU: "false"
     depends_on:

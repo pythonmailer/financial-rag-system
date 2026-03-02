@@ -24,7 +24,8 @@ COLLECTION_NAME = "financial_documents"
 
 request_queue = None
 MAX_BATCH_SIZE = 32
-MAX_CONCURRENT_LLM_CALLS = 50
+# FIX 1: Lowered to prevent Groq API bans during concurrent load testing
+MAX_CONCURRENT_LLM_CALLS = 10 
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
 # ==========================================
@@ -347,7 +348,8 @@ async def generate_answer(system_prompt, user_query):
 # ==========================================
 # BATCH ENGINE
 # ==========================================
-async def process_independently(i, fut, req, batch_vectors):
+# FIX 2: Added q_hash as a parameter to avoid calculating it twice
+async def process_independently(i, fut, req, q_hash, batch_vectors):
     async with llm_semaphore:
         try:
             search = await asyncio.to_thread(
@@ -378,10 +380,6 @@ async def process_independently(i, fut, req, batch_vectors):
                 req.query,
             )
 
-            q_hash = hashlib.sha256(
-                f"{req.ticker}_{req.query.lower()}".encode()
-            ).hexdigest()
-
             asyncio.create_task(
                 asyncio.to_thread(
                     save_to_cache, q_hash, req.query, answer, req.ticker, provider
@@ -405,8 +403,9 @@ async def process_independently(i, fut, req, batch_vectors):
 async def batch_processor():
     while True:
         batch = []
-        fut, req = await request_queue.get()
-        batch.append((fut, req))
+        # FIX 3: Unpack q_hash from the queue
+        fut, req, q_hash = await request_queue.get()
+        batch.append((fut, req, q_hash))
 
         await asyncio.sleep(0.05)
 
@@ -416,8 +415,9 @@ async def batch_processor():
         queries = [item[1].query for item in batch]
         vectors = await asyncio.to_thread(embed_query_batch, queries)
 
-        for i, (fut, req) in enumerate(batch):
-            asyncio.create_task(process_independently(i, fut, req, vectors))
+        # FIX 4: Pass q_hash to the independent processor
+        for i, (fut, req, q_hash) in enumerate(batch):
+            asyncio.create_task(process_independently(i, fut, req, q_hash, vectors))
 
 # ==========================================
 # LIFESPAN
@@ -431,7 +431,8 @@ async def lifespan(app: FastAPI):
         try:
             mlflow.set_tracking_uri("http://mlflow:5001")
             mlflow.set_experiment("Financial-RAG")
-            mlflow.openai.autolog()
+            # FIX 5: Ensure log_traces=True is here to fix the empty async completions
+            mlflow.openai.autolog(log_traces=True)
             print("✅ MLflow initialized successfully.")
         except Exception as e:
             print(f"⚠️ MLflow initialization failed: {e}")
@@ -479,7 +480,8 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
 
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
-    await request_queue.put((fut, req))
+    # FIX 6: Add q_hash to the tuple so we don't recalculate it later
+    await request_queue.put((fut, req, q_hash))
 
     try:
         return await asyncio.wait_for(fut, timeout=30)

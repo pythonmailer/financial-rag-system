@@ -6,6 +6,7 @@ import hashlib
 import numpy as np
 import asyncio
 from functools import lru_cache
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -23,50 +24,66 @@ USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 COLLECTION_NAME = "financial_documents"
 
-app = FastAPI(title="Financial RAG API - Sequential (Baseline)")
-
 # ==========================================
 # CONDITIONAL IMPORTS (Skip heavy deps in CI)
 # ==========================================
 if not TESTING:
     import mlflow
+    import mlflow.openai
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from sentence_transformers import SentenceTransformer, CrossEncoder
     from qdrant_client import QdrantClient
     from qdrant_client.http import models
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
-
-    FastAPIInstrumentor.instrument_app(app)
 else:
     SentenceTransformer = None
     CrossEncoder = None
     QdrantClient = None
     models = None
     AsyncOpenAI = None
-    retry = None
+    retry = lambda *a, **k: (lambda f: f) # Mock retry for testing
 
 # ==========================================
-# LAZY LOADERS
+# LIFESPAN & APP INIT
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not TESTING:
+        try:
+            mlflow.set_tracking_uri("http://mlflow:5001")
+            # Using a distinct experiment name so you can compare baselines easily
+            mlflow.set_experiment("Financial-RAG-Sequential")
+            mlflow.openai.autolog(log_traces=True)
+            print("✅ MLflow initialized successfully.")
+        except Exception as e:
+            print(f"⚠️ MLflow initialization failed: {e}")
+    yield
+
+app = FastAPI(title="Financial RAG API - Sequential (Baseline)", lifespan=lifespan)
+
+if not TESTING:
+    # Instrument for MLflow/OpenTelemetry traces
+    FastAPIInstrumentor.instrument_app(app)
+
+# ==========================================
+# LAZY LOADERS (Optimized for RAM usage)
 # ==========================================
 @lru_cache()
 def get_embedder():
-    if TESTING:
-        return None
+    if TESTING: return None
     device = "cuda" if USE_GPU else "cpu"
     return SentenceTransformer("BAAI/bge-small-en-v1.5", device=device)
 
 @lru_cache()
 def get_reranker():
-    if TESTING:
-        return None
+    if TESTING: return None
     device = "cuda" if USE_GPU else "cpu"
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
 
 @lru_cache()
 def get_qdrant():
-    if TESTING:
-        return None
+    if TESTING: return None
     return QdrantClient(url=QDRANT_URL)
 
 # ==========================================
@@ -129,7 +146,7 @@ def embed(req: EmbedRequest):
     return {"embeddings": vectors.tolist()}
 
 # ==========================================
-# CIRCUIT BREAKER
+# CIRCUIT BREAKER (Multi-Worker Safe)
 # ==========================================
 class CircuitBreaker:
     def __init__(self, name="groq"):
@@ -141,24 +158,20 @@ class CircuitBreaker:
             with open(tmp, "w") as f:
                 json.dump(state, f)
             os.replace(tmp, self.file_path)
-        except:
-            pass
+        except: pass
 
     @property
     def is_healthy(self):
-        if not os.path.exists(self.file_path):
-            return True
+        if not os.path.exists(self.file_path): return True
         try:
-            with open(self.file_path) as f:
-                state = json.load(f)
+            with open(self.file_path) as f: state = json.load(f)
             if not state.get("healthy", True):
                 if time.time() > state.get("disabled_until", 0):
                     self.set_healthy(True)
                     return True
                 return False
             return True
-        except:
-            return True
+        except: return True
 
     def trip(self, cooldown=60):
         self._write({"healthy": False, "disabled_until": time.time() + cooldown})
@@ -178,17 +191,15 @@ if not TESTING:
     )
 
 # ==========================================
-# RAG FUNCTIONS
+# RAG CORE LOGIC
 # ==========================================
 def embed_query(query: str):
-    if TESTING:
-        return [0.0] * 384
+    if TESTING: return [0.0] * 384
     return get_embedder().encode(query).tolist()
 
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
-    if TESTING:
-        return type("obj", (object,), {"points": []})
-
+    if TESTING: return type("obj", (object,), {"points": []})
+    
     try:
         qdrant = get_qdrant()
 
