@@ -28,7 +28,7 @@ services:
       retries: 5
       start_period: 15s
 
-  mlflow:
+mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow_server
     command: >
@@ -38,11 +38,11 @@ services:
       --host 0.0.0.0
       --port 5001
       --allowed-hosts "*"
+      --cors-allowed-origins "*"
+      --disable-security-middleware  # <--- The "Get It Working" Button
     environment:
       - MLFLOW_FLASK_SERVER_SECRET_KEY=super-secret-key-for-resume
       - MLFLOW_HTTP_REQUEST_TIMEOUT=600
-      # Force internal security to allow cross-origin requests
-      - MLFLOW_SERVER_GUNICORN_OPTS="--timeout 600"
     ports:
       - "5001:5001"
     volumes:
