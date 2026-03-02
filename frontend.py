@@ -16,7 +16,6 @@ st.set_page_config(
 FIXED_TICKER = "AAPL"
 BACKEND_HOST = os.getenv("BACKEND_URL", "http://localhost:8001")
 ASK_URL = f"{BACKEND_HOST}/ask"
-FEEDBACK_URL = f"{BACKEND_HOST}/feedback"
 HEALTH_URL = f"{BACKEND_HOST}/ready"
 
 st.markdown("""
@@ -46,26 +45,19 @@ with st.sidebar:
         st.error("● Core Engine: Offline")
 
     st.markdown("### 🛠️ Model Settings")
-    top_k = st.slider(
-        "Retrieval Depth (Top-K)", 1, 10, 5,
-        help="Number of SEC filing chunks retrieved per query."
-    )
+    top_k = st.slider("Retrieval Depth (Top-K)", 1, 10, 5)
 
     st.info(
         f"**Target:** {FIXED_TICKER} (Apple Inc.)\n\n"
         "**Data:** FY2023-2024 10-K/Q Filings"
     )
 
-    st.divider()
-
-    with st.expander("🚀 Tech Highlights"):
-        st.write("- **Hybrid RAG:** Groq/Gemini LPU inference.")
-        st.write("- **Vector DB:** Qdrant with Metadata Filtering.")
-        st.write("- **Efficiency:** Semantic Caching in PostgreSQL.")
-        st.write("- **Accuracy:** Cross-Encoder Reranking.")
-
     if st.button("🧹 Clear Analysis History", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.streaming_done = False
+        st.session_state.answer_saved = False
+        st.session_state.last_answer = None
+        st.session_state.last_sources = []
         st.rerun()
 
 # ==========================================
@@ -76,23 +68,33 @@ st.markdown(
     f"""
 This system provides high-precision answers based strictly on  
 **Apple Inc. ({FIXED_TICKER})** SEC filings.
-
-It leverages semantic search to bypass the noise of standard LLMs.
 """
 )
 
 # ==========================================
-# 4. CHAT STATE
+# 4. SESSION STATE INIT
 # ==========================================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+for key, default in {
+    "messages": [],
+    "streaming_done": False,
+    "answer_saved": False,
+    "last_answer": None,
+    "last_sources": [],
+    "last_provider": None,
+    "last_cached": False,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
+# ==========================================
+# 5. RENDER CHAT HISTORY
+# ==========================================
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 # ==========================================
-# 5. HELPER: SAFE SCORE NORMALIZATION
+# 6. SAFE SCORE NORMALIZATION
 # ==========================================
 def normalize_score(raw_score):
     try:
@@ -103,101 +105,116 @@ def normalize_score(raw_score):
     if math.isnan(raw_score) or math.isinf(raw_score):
         raw_score = 0.0
 
-    # Prevent sigmoid overflow
     raw_score = max(min(raw_score, 10), -10)
-
     norm_score = 1 / (1 + math.exp(-raw_score))
-
     return max(0.0, min(1.0, norm_score))
 
 # ==========================================
-# 6. CHAT INPUT
+# 7. CHAT INPUT
 # ==========================================
-if prompt := st.chat_input(
-    "Ask about Apple's Q3 revenue, R&D growth, or risk factors..."
-):
+if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk factors..."):
+
+    # Reset streaming state for new prompt
+    st.session_state.streaming_done = False
+    st.session_state.answer_saved = False
+    st.session_state.last_answer = None
+    st.session_state.last_sources = []
 
     with st.chat_message("user"):
         st.markdown(prompt)
+
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
 
-        with st.spinner("Retrieving SEC Filings & Reranking Context..."):
-            try:
-                payload = {
-                    "query": prompt,
-                    "ticker": FIXED_TICKER,
-                    "top_k": top_k
-                }
+        # ======================
+        # RUN ONLY ONCE
+        # ======================
+        if not st.session_state.streaming_done:
 
-                response = requests.post(ASK_URL, json=payload, timeout=60)
+            with st.spinner("Retrieving SEC Filings & Reranking Context..."):
+                try:
+                    payload = {
+                        "query": prompt,
+                        "ticker": FIXED_TICKER,
+                        "top_k": top_k
+                    }
 
-                if response.status_code == 200:
-                    data = response.json()
+                    response = requests.post(ASK_URL, json=payload, timeout=60)
 
-                    answer = data.get("answer", "No analysis available.")
-                    is_cached = data.get("cached", False)
-                    provider = data.get("provider", "LLM")
-                    sources = data.get("sources", [])
+                    if response.status_code == 200:
+                        data = response.json()
 
-                    # ======================
-                    # Typing effect
-                    # ======================
-                    full_text = ""
-                    for word in answer.split():
-                        full_text += word + " "
-                        message_placeholder.markdown(full_text + "▌")
-                        time.sleep(0.008)
-                    message_placeholder.markdown(full_text)
+                        answer = data.get("answer", "No analysis available.")
+                        sources = data.get("sources", [])
+                        provider = data.get("provider", "LLM")
+                        is_cached = data.get("cached", False)
 
-                    # ======================
-                    # Metadata Row
-                    # ======================
-                    cols = st.columns(3)
+                        # Save for reruns
+                        st.session_state.last_answer = answer
+                        st.session_state.last_sources = sources
+                        st.session_state.last_provider = provider
+                        st.session_state.last_cached = is_cached
 
-                    with cols[0]:
-                        if is_cached:
-                            st.caption("⚡ **Source:** Semantic Cache (Postgres)")
-                        else:
-                            st.caption(f"🤖 **Inference:** {provider}")
+                        # Typing animation (once)
+                        full_text = ""
+                        for word in answer.split():
+                            full_text += word + " "
+                            message_placeholder.markdown(full_text + "▌")
+                            time.sleep(0.008)
 
-                    with cols[1]:
-                        st.caption(f"📊 **Chunks Retrieved:** {len(sources)}")
+                        message_placeholder.markdown(full_text)
 
-                    # Optional latency display if backend sends it later
-                    with cols[2]:
-                        latency = data.get("llm_ms")
-                        if latency:
-                            st.caption(f"⏱️ **LLM:** {latency:.0f} ms")
+                        st.session_state.streaming_done = True
 
-                    # ======================
-                    # Source Evidence
-                    # ======================
-                    if sources:
-                        with st.expander("📚 View Document Evidence"):
-                            for i, src in enumerate(sources):
-                                score = normalize_score(src.get("score", 0.0))
+                    else:
+                        st.error(f"Analysis failed. Backend returned: {response.status_code}")
 
-                                st.markdown(
-                                    f"**Chunk {i+1}** | Relevancy: `{score:.2%}`"
-                                )
-                                st.progress(score)
-                                st.caption(src.get("text", "")[:400] + "...")
-                                st.divider()
+                except Exception as e:
+                    st.error(f"Connection Error: {e}")
 
-                else:
-                    st.error(
-                        f"Analysis failed. Backend returned: {response.status_code}"
-                    )
+        else:
+            # Rerun path → show final instantly
+            message_placeholder.markdown(st.session_state.last_answer or "")
 
-            except Exception as e:
-                st.error(
-                    f"Connection Error: Ensure your EC2 endpoint is accessible. ({e})"
-                )
+    # ======================================
+    # METADATA ROW (PERSISTENT)
+    # ======================================
+    if st.session_state.last_answer:
+        cols = st.columns(3)
 
-    if "answer" in locals():
+        with cols[0]:
+            if st.session_state.last_cached:
+                st.caption("⚡ **Source:** Semantic Cache (Postgres)")
+            else:
+                st.caption(f"🤖 **Inference:** {st.session_state.last_provider}")
+
+        with cols[1]:
+            st.caption(f"📊 **Chunks Retrieved:** {len(st.session_state.last_sources)}")
+
+    # ======================================
+    # SOURCE EVIDENCE
+    # ======================================
+    if st.session_state.last_sources:
+        with st.expander("📚 View Document Evidence"):
+            for i, src in enumerate(st.session_state.last_sources):
+                score = normalize_score(src.get("score", 0.0))
+
+                st.markdown(f"**Chunk {i+1}** | Relevancy: `{score:.2%}`")
+                st.progress(score)
+                st.caption(src.get("text", "")[:400] + "...")
+                st.divider()
+
+    # ======================================
+    # SAVE ASSISTANT MESSAGE ONCE
+    # ======================================
+    if (
+        st.session_state.streaming_done
+        and not st.session_state.answer_saved
+        and st.session_state.last_answer
+    ):
         st.session_state.messages.append(
-            {"role": "assistant", "content": answer}
+            {"role": "assistant", "content": st.session_state.last_answer}
         )
+        st.session_state.answer_saved = True
