@@ -94,7 +94,7 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # ==========================================
-# 6. SAFE SCORE NORMALIZATION
+# SAFE SCORE NORMALIZATION
 # ==========================================
 def normalize_score(raw_score):
     try:
@@ -105,7 +105,10 @@ def normalize_score(raw_score):
     if math.isnan(raw_score) or math.isinf(raw_score):
         raw_score = 0.0
 
+    # Prevent math overflow by capping extreme values
     raw_score = max(min(raw_score, 10), -10)
+    
+    # Sigmoid function: turns logits (like 5.24) into percentages (like 0.99)
     norm_score = 1 / (1 + math.exp(-raw_score))
     return max(0.0, min(1.0, norm_score))
 
@@ -197,13 +200,22 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
     # SOURCE EVIDENCE
     # ======================================
     if st.session_state.last_sources:
-        with st.expander("📚 View Document Evidence"):
-            for i, src in enumerate(st.session_state.last_sources):
-                score = normalize_score(src.get("score", 0.0))
-                st.markdown(f"**Chunk {i+1}** | Relevancy: `{score:.2%}`")
-                st.progress(score)
-                st.caption(src.get("text", "")[:400] + "...")
-                st.divider()
+            with st.expander("📚 View Document Evidence"):
+                for i, src in enumerate(st.session_state.last_sources):
+                    
+                    # 1. Get the raw cross-encoder score (e.g. 5.24)
+                    raw_score = src.get("score", 0.0)
+                    
+                    # 2. Use the normalize function to squash it to 0.0 - 1.0
+                    normalized_score = normalize_score(raw_score)
+                    
+                    # 3. Double-clamp it just to be 100% safe for Streamlit
+                    safe_score = max(0.0, min(1.0, float(normalized_score)))
+
+                    st.markdown(f"**Chunk {i+1}** | Relevancy: `{safe_score:.2%}`")
+                    st.progress(safe_score) # Now guaranteed to be valid!
+                    st.caption(src.get("text", "")[:400] + "...")
+                    st.divider()
 
     # ======================================
     # SAVE ASSISTANT MESSAGE ONCE
