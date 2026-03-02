@@ -38,6 +38,7 @@ services:
     container_name: mlflow
     environment:
       MLFLOW_HTTP_HOST_VALIDATION_DISABLED: "true"
+      MLFLOW_SERVER_ALLOWED_HOSTS: "*"
     command: >
       mlflow server
       --host 0.0.0.0
