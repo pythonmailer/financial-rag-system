@@ -63,13 +63,19 @@ jobs:
             fi
 
             # 2. Navigate to Project Directory
-            if [ ! -d "$HOME/financial-rag-system" ]; then
+            if [ -d "$HOME/financial-rag-system" ]; then
+              if [ ! -d "$HOME/financial-rag-system/.git" ]; then
+                echo "⚠️ Directory exists but is NOT a git repo. Cleaning up..."
+                sudo rm -rf "$HOME/financial-rag-system"
+                git clone https://github.com/pythonmailer/financial-rag-system ~/financial-rag-system
+              fi
+            else
+              echo "📥 Cloning fresh repository..."
               git clone https://github.com/pythonmailer/financial-rag-system ~/financial-rag-system
             fi
-            cd ~/financial-rag-system
 
-            # 3. Pull Latest Code
-            echo "📥 Fetching latest code from Main..."
+            cd ~/financial-rag-system
+            echo "📥 Syncing code with Main..."
             git fetch origin main
             git reset --hard origin/main
 
