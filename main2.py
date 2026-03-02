@@ -42,16 +42,22 @@ if not TESTING:
     from tenacity import retry, wait_exponential, stop_after_attempt
 
     trace = mlflow.trace
+    start_span = mlflow.start_span
 else:
+    import contextlib
+
     SentenceTransformer = None
     CrossEncoder = None
-    QDRANT_URL = None
     models = None
     AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f)
     wait_exponential = None
     stop_after_attempt = None
     trace = lambda name=None, **kwargs: (lambda f: f)
+
+    @contextlib.contextmanager
+    def start_span(*args, **kwargs):
+        yield None
 
 # ==========================================
 # LAZY LOADERS
@@ -72,6 +78,48 @@ def get_reranker():
 def get_qdrant():
     if TESTING: return None
     return QdrantClient(url=QDRANT_URL)
+
+# ==========================================
+# CIRCUIT BREAKERS
+# ==========================================
+class CircuitBreaker:
+    def __init__(self, service_name="groq"):
+        self.file_path = os.path.join(tempfile.gettempdir(), f"{service_name}_cb_state.json")
+
+    def _write_state(self, state):
+        tmp = self.file_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, self.file_path)
+        except:
+            pass
+
+    @property
+    def is_healthy(self):
+        if not os.path.exists(self.file_path):
+            return True
+        try:
+            with open(self.file_path) as f:
+                state = json.load(f)
+            if not state.get("healthy", True):
+                if time.time() > state.get("disabled_until", 0):
+                    self.set_healthy(True)
+                    return True
+                return False
+            return True
+        except:
+            return True
+
+    def trip(self, cooldown=60):
+        self._write_state({"healthy": False, "disabled_until": time.time() + cooldown})
+
+    def set_healthy(self, healthy=True):
+        self._write_state({"healthy": healthy, "disabled_until": 0})
+
+groq_breaker = CircuitBreaker("groq")
+gemini_breaker = CircuitBreaker("gemini")
+openrouter_breaker = CircuitBreaker("openrouter")
 
 # ==========================================
 # LLM CLIENTS
@@ -168,7 +216,6 @@ def embed(req: EmbedRequest):
 # ==========================================
 # RETRIEVAL
 # ==========================================
-@trace(name="Qdrant_Vector_Search")
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if TESTING:
         return type("obj", (object,), {"points": []})
@@ -201,7 +248,6 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
 # ==========================================
 # RERANK
 # ==========================================
-@trace(name="CrossEncoder_Rerank")
 def rerank_documents(query, texts, top_k):
     if TESTING or not texts:
         idx = list(range(min(top_k, len(texts))))
@@ -215,7 +261,6 @@ def rerank_documents(query, texts, top_k):
 # ==========================================
 # EMBED BATCH
 # ==========================================
-@trace(name="Batch_Embed_Queries")
 def embed_query_batch(queries):
     if TESTING:
         return [[0.0] * 384 for _ in queries]
@@ -260,6 +305,7 @@ if not TESTING:
 # ==========================================
 # GENERATION
 # ==========================================
+@trace(name="Generate_Answer")
 async def generate_answer(system_prompt, user_query):
     if TESTING:
         return "Mock financial analysis response.", "MockProvider"
@@ -301,14 +347,16 @@ async def generate_answer(system_prompt, user_query):
 # ==========================================
 @trace(name="Full_RAG_Pipeline")
 async def process_independently(i, fut, req, q_hash, run_id, batch_vectors):
+    run = None
     if not TESTING and run_id:
-        mlflow.start_run(run_id=run_id)
+        run = mlflow.start_run(run_id=run_id)
 
     async with llm_semaphore:
         try:
-            search = await asyncio.to_thread(
-                retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type
-            )
+            with start_span(name="Qdrant_Vector_Search"):
+                search = await asyncio.to_thread(
+                    retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type
+                )
 
             texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
 
@@ -316,9 +364,11 @@ async def process_independently(i, fut, req, q_hash, run_id, batch_vectors):
                 combined = "No relevant financial data found."
                 sources = []
             else:
-                idx, scores = await asyncio.to_thread(
-                    rerank_documents, req.query, texts, req.top_k
-                )
+                with start_span(name="CrossEncoder_Rerank"):
+                    idx, scores = await asyncio.to_thread(
+                        rerank_documents, req.query, texts, req.top_k
+                    )
+
                 combined = "\n\n".join([texts[j] for j in idx])
                 sources = [
                     {
@@ -359,6 +409,9 @@ async def process_independently(i, fut, req, q_hash, run_id, batch_vectors):
 
         except Exception as e:
             fut.set_exception(e)
+        finally:
+            if run:
+                mlflow.end_run()
 
 # ==========================================
 # BATCH ENGINE
@@ -376,7 +429,9 @@ async def batch_processor():
             batch.append(request_queue.get_nowait())
 
         queries = [item[1].query for item in batch]
-        vectors = await asyncio.to_thread(embed_query_batch, queries)
+
+        with start_span(name="Batch_Embed_Queries"):
+            vectors = await asyncio.to_thread(embed_query_batch, queries)
 
         ctx = contextvars.copy_context()
 
@@ -395,13 +450,9 @@ async def lifespan(app: FastAPI):
     request_queue = asyncio.Queue()
 
     if not TESTING:
-        try:
-            mlflow.set_tracking_uri("http://mlflow:5001")
-            mlflow.set_experiment("Financial-RAG")
-            mlflow.openai.autolog(log_traces=True)
-            print("✅ MLflow initialized successfully.")
-        except Exception as e:
-            print(f"⚠️ MLflow initialization failed: {e}")
+        mlflow.set_tracking_uri("http://mlflow:5001")
+        mlflow.set_experiment("Financial-RAG")
+        mlflow.openai.autolog(log_traces=True)
 
     task = asyncio.create_task(batch_processor())
     yield

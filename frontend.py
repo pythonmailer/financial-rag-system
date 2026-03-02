@@ -3,6 +3,7 @@ import requests
 import os
 import time
 import math
+import re
 
 # ==========================================
 # 1. CONFIGURATION & THEMING
@@ -14,7 +15,8 @@ st.set_page_config(
 )
 
 FIXED_TICKER = "AAPL"
-BACKEND_HOST = os.getenv("BACKEND_URL", "http://localhost:8001")
+# Updated to point to your EC2 IP by default
+BACKEND_HOST = os.getenv("BACKEND_URL", "http://13.232.197.229:8001")
 ASK_URL = f"{BACKEND_HOST}/ask"
 HEALTH_URL = f"{BACKEND_HOST}/ready"
 
@@ -110,7 +112,22 @@ def normalize_score(raw_score):
     return max(0.0, min(1.0, norm_score))
 
 # ==========================================
-# 7. CHAT INPUT
+# 7. STREAM GENERATOR
+# ==========================================
+def stream_tokens(text):
+    tokens = re.findall(r'\S+|\s+', text)
+    chunk = ""
+    for token in tokens:
+        chunk += token
+        if len(chunk) > 15:
+            yield chunk
+            time.sleep(0.01)
+            chunk = ""
+    if chunk:
+        yield chunk
+
+# ==========================================
+# 8. CHAT INPUT
 # ==========================================
 if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk factors..."):
 
@@ -157,15 +174,8 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
                         st.session_state.last_provider = provider
                         st.session_state.last_cached = is_cached
 
-                        # Typing animation (once)
-                        full_text = ""
-                        for word in answer.split():
-                            full_text += word + " "
-                            message_placeholder.markdown(full_text + "▌")
-                            time.sleep(0.008)
-
-                        message_placeholder.markdown(full_text)
-
+                        # Stream text safely
+                        st.write_stream(stream_tokens(answer))
                         st.session_state.streaming_done = True
 
                     else:
@@ -176,7 +186,7 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
 
         else:
             # Rerun path → show final instantly
-            message_placeholder.markdown(st.session_state.last_answer or "")
+            st.markdown(st.session_state.last_answer or "")
 
     # ======================================
     # METADATA ROW (PERSISTENT)
@@ -186,7 +196,7 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
 
         with cols[0]:
             if st.session_state.last_cached:
-                st.caption("⚡ **Source:** Semantic Cache (Postgres)")
+                st.caption("⚡ **Source:** Semantic Cache")
             else:
                 st.caption(f"🤖 **Inference:** {st.session_state.last_provider}")
 

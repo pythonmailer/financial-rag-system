@@ -38,7 +38,10 @@ if not TESTING:
     from tenacity import retry, wait_exponential, stop_after_attempt
 
     trace = mlflow.trace
+    start_span = mlflow.start_span
 else:
+    import contextlib
+
     SentenceTransformer = None
     CrossEncoder = None
     QdrantClient = None
@@ -46,6 +49,10 @@ else:
     AsyncOpenAI = None
     retry = lambda *a, **k: (lambda f: f)
     trace = lambda name=None, **kwargs: (lambda f: f)
+
+    @contextlib.contextmanager
+    def start_span(*args, **kwargs):
+        yield None
 
 # ==========================================
 # LIFESPAN & APP INIT
@@ -191,12 +198,10 @@ if not TESTING:
 # ==========================================
 # RAG CORE (TRACED)
 # ==========================================
-@trace(name="Embed_Query")
 def embed_query(query: str):
     if TESTING: return [0.0] * 384
     return get_embedder().encode(query).tolist()
 
-@trace(name="Qdrant_Vector_Search")
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if TESTING: return type("obj", (object,), {"points": []})
     try:
@@ -223,7 +228,6 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     except Exception:
         return type("obj", (object,), {"points": []})
 
-@trace(name="CrossEncoder_Rerank")
 def rerank_documents(query, texts, top_k):
     if TESTING or not texts:
         return list(range(min(top_k, len(texts)))), np.zeros(len(texts))
@@ -263,6 +267,7 @@ if not TESTING:
             timeout=12,
         )
 
+@trace(name="Generate_Answer")
 async def generate_answer(system_prompt, user_query):
     if TESTING:
         return "Mock financial analysis response.", "MockProvider"
@@ -335,26 +340,29 @@ async def _ask_impl(req: QueryRequest, background_tasks: BackgroundTasks, db: Se
         mlflow.set_tag("top_k", req.top_k)
 
     # EMBED
-    t0 = time.time()
-    query_vector = embed_query(req.query)
-    if not TESTING:
-        mlflow.log_metric("embed_ms", (time.time() - t0) * 1000)
+    with start_span(name="Embed_Query"):
+        t0 = time.time()
+        query_vector = await asyncio.to_thread(embed_query, req.query)
+        if not TESTING:
+            mlflow.log_metric("embed_ms", (time.time() - t0) * 1000)
 
     # RETRIEVE
-    t1 = time.time()
-    search = retrieve_from_qdrant(query_vector, req.ticker, req.document_type)
-    if not TESTING:
-        mlflow.log_metric("qdrant_ms", (time.time() - t1) * 1000)
+    with start_span(name="Qdrant_Vector_Search"):
+        t1 = time.time()
+        search = await asyncio.to_thread(retrieve_from_qdrant, query_vector, req.ticker, req.document_type)
+        if not TESTING:
+            mlflow.log_metric("qdrant_ms", (time.time() - t1) * 1000)
 
     texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
 
     # RERANK
-    t2 = time.time()
-    idx, scores = rerank_documents(req.query, texts, req.top_k)
-    if not TESTING:
-        mlflow.log_metric("rerank_ms", (time.time() - t2) * 1000)
-        mlflow.log_metric("retrieved_docs", len(texts))
-        mlflow.log_metric("reranked_docs", len(idx))
+    with start_span(name="CrossEncoder_Rerank"):
+        t2 = time.time()
+        idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
+        if not TESTING:
+            mlflow.log_metric("rerank_ms", (time.time() - t2) * 1000)
+            mlflow.log_metric("retrieved_docs", len(texts))
+            mlflow.log_metric("reranked_docs", len(idx))
 
     context = "\n\n".join([texts[i] for i in idx]) if len(idx) else "No relevant context."
 
