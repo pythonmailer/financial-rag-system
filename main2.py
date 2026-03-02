@@ -5,6 +5,7 @@ import tempfile
 import hashlib
 import numpy as np
 import asyncio
+import contextvars
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
@@ -24,7 +25,7 @@ COLLECTION_NAME = "financial_documents"
 
 request_queue = None
 MAX_BATCH_SIZE = 32
-MAX_CONCURRENT_LLM_CALLS = 10 
+MAX_CONCURRENT_LLM_CALLS = 10
 llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
 # ==========================================
@@ -40,7 +41,6 @@ if not TESTING:
     from openai import AsyncOpenAI
     from tenacity import retry, wait_exponential, stop_after_attempt
 
-    # Map the real decorator
     trace = mlflow.trace
 else:
     SentenceTransformer = None
@@ -51,12 +51,10 @@ else:
     retry = lambda *a, **k: (lambda f: f)
     wait_exponential = None
     stop_after_attempt = None
-
-    # Dummy decorator for testing environments
     trace = lambda name=None, **kwargs: (lambda f: f)
 
 # ==========================================
-# LAZY MODELS (production only)
+# LAZY MODELS
 # ==========================================
 @lru_cache()
 def get_embedder():
@@ -79,7 +77,7 @@ def get_qdrant():
     return QdrantClient(url=QDRANT_URL)
 
 # ==========================================
-# LLM CLIENTS (production only)
+# LLM CLIENTS
 # ==========================================
 if not TESTING:
     primary_client = AsyncOpenAI(
@@ -217,7 +215,7 @@ gemini_breaker = CircuitBreaker("gemini")
 openrouter_breaker = CircuitBreaker("openrouter")
 
 # ==========================================
-# RETRIEVAL (Now Traced)
+# RETRIEVAL
 # ==========================================
 @trace(name="Qdrant_Vector_Search")
 def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
@@ -228,21 +226,21 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
     if not qdrant:
         return type("obj", (object,), {"points": []})
 
-    try:
-        must = [
+    must = [
+        models.FieldCondition(
+            key="ticker",
+            match=models.MatchValue(value=ticker.upper()),
+        )
+    ]
+    if document_type:
+        must.append(
             models.FieldCondition(
-                key="ticker",
-                match=models.MatchValue(value=ticker.upper()),
+                key="document_type",
+                match=models.MatchValue(value=document_type.upper()),
             )
-        ]
-        if document_type:
-            must.append(
-                models.FieldCondition(
-                    key="document_type",
-                    match=models.MatchValue(value=document_type.upper()),
-                )
-            )
+        )
 
+    try:
         return qdrant.query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
@@ -253,7 +251,7 @@ def retrieve_from_qdrant(query_vector, ticker, document_type=None, limit=15):
         return type("obj", (object,), {"points": []})
 
 # ==========================================
-# RERANK (Now Traced)
+# RERANK
 # ==========================================
 @trace(name="CrossEncoder_Rerank")
 def rerank_documents(query, texts, top_k):
@@ -268,7 +266,7 @@ def rerank_documents(query, texts, top_k):
     return idx, scores
 
 # ==========================================
-# EMBED BATCH (Now Traced)
+# EMBED BATCH
 # ==========================================
 @trace(name="Batch_Embed_Queries")
 def embed_query_batch(queries):
@@ -353,7 +351,7 @@ async def generate_answer(system_prompt, user_query):
     return "⚠️ All providers unavailable.", "System Degraded"
 
 # ==========================================
-# BATCH ENGINE (Main Trace Entrypoint)
+# PROCESS
 # ==========================================
 @trace(name="Full_RAG_Pipeline")
 async def process_independently(i, fut, req, q_hash, batch_vectors):
@@ -382,6 +380,12 @@ async def process_independently(i, fut, req, q_hash, batch_vectors):
                     for j in idx
                 ]
 
+            if not TESTING:
+                mlflow.set_tag("ticker", req.ticker)
+                mlflow.set_tag("top_k", req.top_k)
+                mlflow.log_metric("retrieved_docs", len(texts))
+                mlflow.log_metric("reranked_docs", len(sources))
+
             answer, provider = await generate_answer(
                 f"You are a Wall Street analyst. Use ONLY this context:\n{combined}",
                 req.query,
@@ -407,6 +411,9 @@ async def process_independently(i, fut, req, q_hash, batch_vectors):
         except Exception as e:
             fut.set_exception(e)
 
+# ==========================================
+# BATCH ENGINE
+# ==========================================
 async def batch_processor():
     while True:
         batch = []
@@ -421,8 +428,13 @@ async def batch_processor():
         queries = [item[1].query for item in batch]
         vectors = await asyncio.to_thread(embed_query_batch, queries)
 
+        ctx = contextvars.copy_context()
+
         for i, (fut, req, q_hash) in enumerate(batch):
-            asyncio.create_task(process_independently(i, fut, req, q_hash, vectors))
+            ctx.run(
+                asyncio.create_task,
+                process_independently(i, fut, req, q_hash, vectors),
+            )
 
 # ==========================================
 # LIFESPAN
@@ -463,10 +475,9 @@ def feedback(req: FeedbackRequest, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 # ==========================================
-# ASK
+# ASK IMPLEMENTATION
 # ==========================================
-@app.post("/ask")
-async def ask(req: QueryRequest, db: Session = Depends(get_db)):
+async def _ask_impl(req: QueryRequest, db: Session):
     q_hash = hashlib.sha256(f"{req.ticker}_{req.query.lower()}".encode()).hexdigest()
 
     cached = db.query(CacheEntry).filter(CacheEntry.query_hash == q_hash).first()
@@ -490,3 +501,14 @@ async def ask(req: QueryRequest, db: Session = Depends(get_db)):
         return await asyncio.wait_for(fut, timeout=30)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Request timed out")
+
+# ==========================================
+# ASK ENDPOINT WITH ROOT TRACE
+# ==========================================
+@app.post("/ask")
+async def ask(req: QueryRequest, db: Session = Depends(get_db)):
+    if not TESTING:
+        with mlflow.start_span(name="ASK_Request"):
+            return await _ask_impl(req, db)
+    else:
+        return await _ask_impl(req, db)
