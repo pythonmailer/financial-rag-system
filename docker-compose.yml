@@ -31,7 +31,6 @@ services:
   mlflow:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow_server
-    # Added --allowed-hosts "*" to fix "Invalid Host header" error
     command: >
       mlflow server
       --backend-store-uri sqlite:////mlruns/mlflow.db
@@ -41,7 +40,9 @@ services:
       --allowed-hosts "*"
     environment:
       - MLFLOW_FLASK_SERVER_SECRET_KEY=super-secret-key-for-resume
-      - MLFLOW_HTTP_REQUEST_TIMEOUT=120
+      - MLFLOW_HTTP_REQUEST_TIMEOUT=600
+      # Force internal security to allow cross-origin requests
+      - MLFLOW_SERVER_GUNICORN_OPTS="--timeout 600"
     ports:
       - "5001:5001"
     volumes:
