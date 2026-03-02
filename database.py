@@ -2,30 +2,36 @@ import os
 import time
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    Index,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
 # ==========================================
-# 🌐 HARDCODED INFRASTRUCTURE CONFIG
+# 🌐 INFRA CONFIG
 # ==========================================
-# Using your provided AWS Elastic IP directly
 AWS_IP = "13.232.197.229"
 
-# We prioritize environment variables (from .env or docker-compose)
-# but fallback to your static AWS IP.
 QDRANT_URL = os.getenv("QDRANT_URL", f"http://{AWS_IP}:6333")
-DATABASE_URL = os.getenv("DATABASE_URL", f"postgresql://admin:adminpassword@{AWS_IP}:5432/financial_rag")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://admin:adminpassword@{AWS_IP}:5432/financial_rag",
+)
 
 COLLECTION_NAME = "financial_documents"
-VECTOR_SIZE = 384  # must match BGE embedding model
+VECTOR_SIZE = 384
 
-# ==========================================
-# CONFIG
-# ==========================================
 TESTING = os.getenv("TESTING", "False") == "True"
+USE_ALEMBIC = os.getenv("USE_ALEMBIC", "False") == "True"
 
 # ==========================================
 # SQLALCHEMY ENGINE
@@ -36,7 +42,6 @@ if TESTING:
         connect_args={"check_same_thread": False},
     )
 else:
-    # pool_pre_ping=True is vital for AWS to handle dropped connections
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
@@ -58,6 +63,9 @@ class FeedbackEntry(Base):
     rating = Column(Integer)  # 1 = 👍, -1 = 👎
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+    def __repr__(self):
+        return f"<Feedback {self.query_hash} rating={self.rating}>"
+
 
 class CacheEntry(Base):
     __tablename__ = "semantic_cache"
@@ -70,27 +78,39 @@ class CacheEntry(Base):
     ticker = Column(String, index=True)
     provider = Column(String, nullable=True)
 
+    __table_args__ = (
+        Index("idx_ticker_query", "ticker", "query_hash"),
+    )
+
+    def __repr__(self):
+        return f"<Cache {self.ticker}:{self.query_hash[:8]}>"
+
 # ==========================================
 # DB INIT
 # ==========================================
 def init_db():
     if TESTING:
         Base.metadata.create_all(bind=engine)
-        print("✅ SQLite test database initialized.")
+        print("✅ SQLite test DB initialized")
+        return
+
+    if USE_ALEMBIC:
+        print("⚠️ Alembic enabled → skipping SQLAlchemy create_all")
         return
 
     try:
         Base.metadata.create_all(bind=engine)
-        print(f"✅ DB connection verified at: {DATABASE_URL.split('@')[-1]}")
+        print(f"✅ DB tables ready at {DATABASE_URL.split('@')[-1]}")
     except Exception as e:
-        print(f"⚠️ DB init skipped (likely using Alembic): {e}")
+        print(f"❌ DB init failed: {e}")
+        raise
 
 # ==========================================
 # QDRANT INIT
 # ==========================================
 def init_qdrant():
     if TESTING:
-        print("跑 Skipping Qdrant init (TESTING=True).")
+        print("🧪 Skipping Qdrant init (TESTING=True)")
         return
 
     retries = 5
@@ -108,22 +128,22 @@ def init_qdrant():
                         distance=Distance.COSINE,
                     ),
                 )
-                print(f"✅ Qdrant collection '{COLLECTION_NAME}' created at {QDRANT_URL}")
+                print(f"✅ Qdrant collection created at {QDRANT_URL}")
             else:
-                print(f"✅ Qdrant collection '{COLLECTION_NAME}' exists at {QDRANT_URL}")
+                print(f"✅ Qdrant collection exists at {QDRANT_URL}")
 
             return
 
         except Exception as e:
             print(
-                f"⏳ Waiting for Qdrant at {QDRANT_URL}... ({attempt}/{retries})"
+                f"⏳ Qdrant not ready ({attempt}/{retries}) → {str(e)}"
             )
             time.sleep(delay)
 
-    print("❌ CRITICAL: Could not connect to Qdrant.")
+    raise RuntimeError("❌ Could not connect to Qdrant")
 
 # ==========================================
-# SAFE STARTUP HOOKS
+# STARTUP HOOK
 # ==========================================
 if __name__ == "__main__":
     init_db()

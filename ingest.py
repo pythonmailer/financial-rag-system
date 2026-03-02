@@ -1,10 +1,9 @@
 import os
-import uuid
 import hashlib
 import requests
 import time
-import math
 from datetime import datetime, timezone
+
 from bs4 import BeautifulSoup
 from sec_edgar_downloader import Downloader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,13 +11,10 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, Distance, VectorParams
 
 # ==========================================
-# 🌐 HARDCODED INFRASTRUCTURE CONFIG
+# 🌐 INFRA CONFIG
 # ==========================================
-# Using your provided AWS Elastic IP for the Backend
 AWS_IP = "13.232.197.229"
 
-# In Docker, the ingestor talks to 'qdrant' over the internal bridge.
-# If running locally, you can override these with .env
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 BACKEND_URL = os.getenv("BACKEND_URL", f"http://{AWS_IP}:8001")
 
@@ -28,38 +24,38 @@ READY_URL = f"{BACKEND_URL}/ready"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-BATCH_SIZE = 64  # batch embedding size
+EMBED_BATCH = 64
+UPSERT_BATCH = 256
 
-print(f"🛠️ Configured Ingestor: Backend @ {BACKEND_URL} | Qdrant @ {QDRANT_URL}")
+print(f"🛠️ Ingestor Config → Backend: {BACKEND_URL} | Qdrant: {QDRANT_URL}")
 
 # ==========================================
 # WAIT FOR BACKEND
 # ==========================================
 def wait_for_backend():
-    print(f"⏳ Checking backend readiness at {READY_URL}...")
+    print(f"⏳ Waiting for backend at {READY_URL}")
     for i in range(30):
         try:
             r = requests.get(READY_URL, timeout=5)
             if r.status_code == 200:
-                print("✅ Backend is ready")
+                print("✅ Backend ready")
                 return
-        except Exception as e:
+        except Exception:
             pass
-        print(f"   (Retrying... {i+1}/30)")
+        print(f"   Retry {i+1}/30")
         time.sleep(3)
-    raise RuntimeError(f"❌ Backend at {BACKEND_URL} not ready")
+    raise RuntimeError("❌ Backend not ready")
 
 # ==========================================
-# EMBED VIA BACKEND (BATCHED)
+# EMBEDDING (BATCHED VIA BACKEND)
 # ==========================================
 def embed_chunks(chunks):
     embeddings = []
-    print(f"🧠 Embedding {len(chunks)} chunks via Backend...")
-    
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch = chunks[i : i + BATCH_SIZE]
+    print(f"🧠 Embedding {len(chunks)} chunks")
+
+    for i in range(0, len(chunks), EMBED_BATCH):
+        batch = chunks[i : i + EMBED_BATCH]
         try:
-            # Increased timeout for heavy batch embedding
             r = requests.post(EMBED_URL, json={"texts": batch}, timeout=180)
             r.raise_for_status()
             embeddings.extend(r.json()["embeddings"])
@@ -72,31 +68,35 @@ def embed_chunks(chunks):
 # ==========================================
 # TEXT CHUNKING
 # ==========================================
-def chunk_text(text):
+def chunk_text(text: str):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
-    return splitter.split_text(text)
+    chunks = splitter.split_text(text)
+
+    # 🔧 remove empty / whitespace chunks
+    chunks = [c for c in chunks if c.strip()]
+    return chunks
 
 # ==========================================
 # QDRANT SETUP
 # ==========================================
-def ensure_collection(qdrant):
+def ensure_collection(qdrant: QdrantClient):
     if not qdrant.collection_exists(COLLECTION_NAME):
-        print(f"🧱 Creating Qdrant collection: {COLLECTION_NAME}")
+        print(f"🧱 Creating collection: {COLLECTION_NAME}")
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(
-                size=384,  # BGE-small-en-v1.5 vector size
+                size=384,  # BGE-small-en-v1.5
                 distance=Distance.COSINE,
             ),
         )
         print("✅ Collection created")
 
 # ==========================================
-# PROCESS HTML → TEXT
+# HTML → TEXT
 # ==========================================
 def extract_text_from_html(html_path):
     with open(html_path, "r", encoding="utf-8") as f:
@@ -107,11 +107,10 @@ def extract_text_from_html(html_path):
 # INGESTION PIPELINE
 # ==========================================
 def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
-    print(f"🚀 Starting ingestion for {ticker}")
+    print(f"🚀 Ingesting {ticker}")
 
     wait_for_backend()
 
-    # Connection to Qdrant (Internal Docker DNS)
     qdrant = QdrantClient(url=QDRANT_URL)
     ensure_collection(qdrant)
 
@@ -120,13 +119,13 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
     total_chunks = 0
 
     for f_type in filing_types:
-        print(f"📡 Downloading {f_type} for {ticker}")
+        print(f"📡 Downloading {f_type}")
         dl.get(f_type, ticker, limit=limit, download_details=True)
 
         base_path = f"./sec_data/sec-edgar-filings/{ticker}/{f_type}"
 
         if not os.path.exists(base_path):
-            print(f"⚠️ No data found for {f_type}")
+            print(f"⚠️ No filings found for {f_type}")
             continue
 
         for root, _, files in os.walk(base_path):
@@ -138,15 +137,20 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
                     text = extract_text_from_html(html_path)
                     chunks = chunk_text(text)
 
-                    print(f"✂️ Created {len(chunks)} segments")
+                    if not chunks:
+                        print("⚠️ No valid chunks")
+                        continue
+
+                    print(f"✂️ {len(chunks)} chunks created")
 
                     embeddings = embed_chunks(chunks)
 
                     points = []
                     for chunk, vector in zip(chunks, embeddings):
-                        # Unique ID to prevent duplicate chunks in Qdrant
+
+                        # ✅ deterministic, collision-safe ID
                         chunk_hash = hashlib.md5(
-                            f"{ticker}_{f_type}_{chunk[:100]}".encode()
+                            f"{ticker}_{f_type}_{file}_{chunk}".encode()
                         ).hexdigest()
 
                         points.append(
@@ -163,27 +167,33 @@ def run_ingestion(ticker="AAPL", filing_types=("10-K", "10-Q"), limit=1):
                             )
                         )
 
-                    # Bulk upsert to Qdrant
-                    qdrant.upsert(
-                        collection_name=COLLECTION_NAME,
-                        points=points,
-                    )
+                    # ✅ memory-safe batched upsert
+                    for i in range(0, len(points), UPSERT_BATCH):
+                        qdrant.upsert(
+                            collection_name=COLLECTION_NAME,
+                            points=points[i : i + UPSERT_BATCH],
+                        )
 
                     total_chunks += len(points)
                     print(f"✅ Indexed {len(points)} vectors")
 
-    print(f"🎉 Ingestion complete: {total_chunks} total chunks indexed")
+    print(f"🎉 Done → {total_chunks} total chunks indexed")
 
     # ======================================
     # CACHE INVALIDATION
     # ======================================
     try:
         cache_url = f"{BACKEND_URL}/cache/clear/{ticker}"
-        requests.delete(cache_url, timeout=10)
-        print(f"🧹 Semantic cache cleared for {ticker}")
-    except:
-        # We expect a 404 if the endpoint isn't defined yet, which is fine
-        print("⚠️ Cache clear skipped (Endpoint might not exist yet)")
+        r = requests.delete(cache_url, timeout=10)
+        if r.status_code == 200:
+            print(f"🧹 Cache cleared for {ticker}")
+        else:
+            print(f"⚠️ Cache clear returned {r.status_code}")
+    except Exception as e:
+        print(f"⚠️ Cache clear failed: {e}")
 
+# ==========================================
+# ENTRYPOINT
+# ==========================================
 if __name__ == "__main__":
     run_ingestion()

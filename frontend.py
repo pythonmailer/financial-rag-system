@@ -130,7 +130,12 @@ if prompt := st.chat_input("Ask about Apple's margins, iPhone sales, or net inco
         response = None
         with st.spinner(""):
             try:
-                payload = {"query": prompt, "ticker": FIXED_TICKER, "top_k": top_k}
+                payload = {
+                    "query": prompt,
+                    "ticker": FIXED_TICKER,
+                    "top_k": top_k,
+                    "document_type": None,
+                }
                 response = requests.post(ASK_URL, json=payload, timeout=95)
             except Exception as e:
                 st.error(f"Connection Error: {e}")
