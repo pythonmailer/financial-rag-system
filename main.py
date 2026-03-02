@@ -196,6 +196,16 @@ if not TESTING:
     )
 
 # ==========================================
+# QUERY ROUTER
+# ==========================================
+def route_query(query: str) -> str:
+    """Lightweight heuristic to classify queries as SIMPLE or COMPLEX."""
+    complex_keywords = ["compare", "analyze", "why", "impact", "trends", "growth", "risk"]
+    if len(query.split()) > 20 or any(kw in query.lower() for kw in complex_keywords):
+        return "COMPLEX"
+    return "SIMPLE"
+
+# ==========================================
 # RAG CORE (TRACED)
 # ==========================================
 def embed_query(query: str):
@@ -268,21 +278,24 @@ if not TESTING:
         )
 
 @trace(name="Generate_Answer")
-async def generate_answer(system_prompt, user_query):
+async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
     if TESTING:
         return "Mock financial analysis response.", "MockProvider"
+
+    # 🚨 DYNAMIC ROUTING: Use 8B for fast queries, 70B for deep analysis
+    groq_model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
 
     if groq_breaker.is_healthy:
         try:
             resp = await safe_llm_call(
                 primary_client,
-                "llama-3.1-8b-instant",
+                groq_model,
                 [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_query},
                 ],
             )
-            return resp.choices[0].message.content, "Groq"
+            return resp.choices[0].message.content, f"Groq ({groq_model})"
         except:
             groq_breaker.trip()
 
@@ -318,6 +331,9 @@ async def ask(req: QueryRequest, background_tasks: BackgroundTasks, db: Session 
 # IMPLEMENTATION
 # ==========================================
 async def _ask_impl(req: QueryRequest, background_tasks: BackgroundTasks, db: Session):
+    # 🚨 Capture arrival time for End-to-End latency
+    req_arrival_time = time.time()
+    
     q_hash = hashlib.sha256(
         f"{req.ticker}_{req.query.lower()}".encode()
     ).hexdigest()
@@ -339,42 +355,54 @@ async def _ask_impl(req: QueryRequest, background_tasks: BackgroundTasks, db: Se
         mlflow.set_tag("ticker", req.ticker)
         mlflow.set_tag("top_k", req.top_k)
 
-    # EMBED
+    # 1. ROUTER TIMING
+    with start_span(name="Query_Router"):
+        t_router = time.time()
+        complexity = route_query(req.query)
+        if not TESTING:
+            mlflow.log_metric("router_latency_ms", (time.time() - t_router) * 1000)
+            mlflow.set_tag("query_complexity", complexity)
+
+    # 2. EMBED TIMING
     with start_span(name="Embed_Query"):
         t0 = time.time()
         query_vector = await asyncio.to_thread(embed_query, req.query)
         if not TESTING:
-            mlflow.log_metric("embed_ms", (time.time() - t0) * 1000)
+            mlflow.log_metric("embed_latency_ms", (time.time() - t0) * 1000)
 
-    # RETRIEVE
+    # 3. RETRIEVAL TIMING
     with start_span(name="Qdrant_Vector_Search"):
         t1 = time.time()
         search = await asyncio.to_thread(retrieve_from_qdrant, query_vector, req.ticker, req.document_type)
         if not TESTING:
-            mlflow.log_metric("qdrant_ms", (time.time() - t1) * 1000)
+            mlflow.log_metric("qdrant_latency_ms", (time.time() - t1) * 1000)
 
     texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
 
-    # RERANK
+    # 4. RERANK TIMING
     with start_span(name="CrossEncoder_Rerank"):
         t2 = time.time()
         idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
         if not TESTING:
-            mlflow.log_metric("rerank_ms", (time.time() - t2) * 1000)
+            mlflow.log_metric("rerank_latency_ms", (time.time() - t2) * 1000)
             mlflow.log_metric("retrieved_docs", len(texts))
             mlflow.log_metric("reranked_docs", len(idx))
 
     context = "\n\n".join([texts[i] for i in idx]) if len(idx) else "No relevant context."
 
-    # LLM
+    # 5. LLM TIMING
     t3 = time.time()
     answer, provider = await generate_answer(
         f"You are a Wall Street analyst. Use ONLY this context:\n{context}",
         req.query,
+        complexity  # Pass complexity to trigger the 8B vs 70B shift
     )
     if not TESTING:
-        mlflow.log_metric("llm_ms", (time.time() - t3) * 1000)
+        mlflow.log_metric("llm_latency_ms", (time.time() - t3) * 1000)
         mlflow.set_tag("provider", provider)
+        
+        # Total End-to-End Latency
+        mlflow.log_metric("total_e2e_ms", (time.time() - req_arrival_time) * 1000)
 
     sources = [
         {"score": float(scores[i]), "text": texts[i], "document_type": "SEC Filing"}

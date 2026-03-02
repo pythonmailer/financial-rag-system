@@ -227,7 +227,7 @@ async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
     if TESTING: return "Mock answer.", "Mock"
     msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}]
     
-    # 🚨 DYNAMIC ROUTING: Use 8B for fast queries, 70B for deep analysis
+    # DYNAMIC ROUTING: Use 8B for fast queries, 70B for deep analysis
     groq_model = "llama-3.3-70b-versatile" if complexity == "COMPLEX" else "llama-3.1-8b-instant"
 
     if groq_breaker.is_healthy:
@@ -252,18 +252,18 @@ async def generate_answer(system_prompt, user_query, complexity="SIMPLE"):
 # ==========================================
 @trace(name="Full_RAG_Pipeline")
 async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time, embed_ms):
-    # 🚨 Calculate Time-in-Queue
+    # Calculate Time-in-Queue
     queue_wait_ms = (time.time() - req_arrival_time) * 1000
 
     async with llm_semaphore:
         try:
-            # 1. ROUTER TIMING
+            # 1. ROUTER TIMING (Creates a Trace Waterfall Block)
             t0 = time.time()
             with start_span(name="Query_Router"):
                 complexity = route_query(req.query)
             router_ms = (time.time() - t0) * 1000
 
-            # 2. RETRIEVAL TIMING
+            # 2. RETRIEVAL TIMING (Creates a Trace Waterfall Block)
             t1 = time.time()
             with start_span(name="Qdrant_Vector_Search"):
                 search = await asyncio.to_thread(retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type)
@@ -275,7 +275,7 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
             if not texts:
                 combined, sources = "No context found.", []
             else:
-                # 3. RERANK TIMING
+                # 3. RERANK TIMING (Creates a Trace Waterfall Block)
                 t2 = time.time()
                 with start_span(name="CrossEncoder_Rerank"):
                     idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
@@ -289,7 +289,7 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
             answer, provider = await generate_answer(f"Analyst context:\n{combined}", req.query, complexity)
             llm_ms = (time.time() - t3) * 1000
 
-            # 5. LOG EXPLICIT METRICS TO MLFLOW
+            # 5. LOG EXPLICIT METRICS TO MLFLOW (Builds the Line Charts)
             if not TESTING:
                 mlflow.set_tag("ticker", req.ticker)
                 mlflow.set_tag("query_complexity", complexity)
@@ -318,7 +318,6 @@ async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_
 async def batch_processor():
     while True:
         batch = []
-        # Unpack the new arrival time variable
         fut, req, q_hash, ctx, req_arrival_time = await request_queue.get()
         batch.append((fut, req, q_hash, ctx, req_arrival_time))
         await asyncio.sleep(0.05)
@@ -328,16 +327,15 @@ async def batch_processor():
 
         queries = [item[1].query for item in batch]
         
-        # 🚨 Time the Embedding step!
         t_embed = time.time()
         with start_span(name="Batch_Embed_Queries"):
             vectors = await asyncio.to_thread(embed_query_batch, queries)
-        embed_ms = (time.time() - t_embed) * 1000 / len(batch) # Average per query
+        embed_ms = (time.time() - t_embed) * 1000 / len(batch) 
 
         for i, (fut, req, q_hash, ctx, req_arrival_time) in enumerate(batch):
+            # Preserving the trace context inside the background queue
             ctx.run(
                 asyncio.create_task,
-                # Pass arrival_time and embed_ms to the worker
                 process_independently(i, fut, req, q_hash, vectors, req_arrival_time, embed_ms),
             )
 
@@ -377,9 +375,8 @@ async def _ask_impl(req: QueryRequest, db: Session):
     fut = loop.create_future()
     
     ctx = contextvars.copy_context()
-    req_arrival_time = time.time() # 🚨 Capture arrival time
+    req_arrival_time = time.time() 
     
-    # Pass it into the queue
     await request_queue.put((fut, req, q_hash, ctx, req_arrival_time))
 
     try:
@@ -391,6 +388,7 @@ async def _ask_impl(req: QueryRequest, db: Session):
 async def ask(req: QueryRequest, db: Session = Depends(get_db)):
     if not TESTING:
         with mlflow.start_run(run_name="rag_request", nested=True):
+            # Creates the root trace in the waterfall
             with mlflow.start_span(name="ASK_Request"):
                 return await _ask_impl(req, db)
     return await _ask_impl(req, db)
