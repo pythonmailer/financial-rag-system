@@ -184,65 +184,81 @@ if not TESTING:
 # ==========================================
 # PROCESS (Exact Old Working Style)
 # ==========================================
-async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time):
-    with start_span(name=f"RAG-Workflow-{req.ticker}") as root_span:
-        async with llm_semaphore:
+# ==========================================
+# PROCESS PIPELINE
+# ==========================================
+@trace(name="RAG_Workflow")
+async def process_independently(i, fut, req, q_hash, batch_vectors, req_arrival_time, run_id=None):
+    client = MLFLOW_CLIENT
+    
+    # Grab the automatically created root span to add global inputs/outputs
+    root_span = mlflow.get_current_active_span()
+    if root_span:
+        root_span.set_inputs({"user_query": req.query, "ticker": req.ticker})
+
+    async with llm_semaphore:
+        try:
+            # --- STEP 1: ROUTER ---
+            with start_span(name="1_Query_Routing", span_type=SpanType.TOOL) as span:
+                complexity = route_query(req.query)
+                span.set_outputs({"routing_result": complexity})
+
+            # --- STEP 2: RETRIEVAL ---
+            # Explicitly setting the attribute ensures the UI recognizes the "RETRIEVER" type
+            with start_span(name="2_Vector_Retrieval", span_type=SpanType.RETRIEVER) as span:
+                span.set_attribute("span_type", "RETRIEVER") # 👈 Fixes the UI missing tab error
+                t_start = time.time()
+                search = await asyncio.to_thread(retrieve_from_qdrant, batch_vectors[i], req.ticker, req.document_type)
+                q_latency = (time.time() - t_start) * 1000
+                
+                texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
+                span.set_attribute("qdrant_latency_ms", q_latency)
+                span.set_outputs({"retrieved_count": len(texts), "retrieved_texts": texts})
+
+            if not texts:
+                combined, sources = "No context found.", []
+                rerank_ms = 0
+            else:
+                # --- STEP 3: RERANKING ---
+                with start_span(name="3_Reranking", span_type=SpanType.TOOL) as span:
+                    t_rerank = time.time()
+                    idx, scores = await asyncio.to_thread(rerank_documents, req.query, texts, req.top_k)
+                    rerank_ms = (time.time() - t_rerank) * 1000
+                    
+                    combined = "\n\n".join([texts[j] for j in idx])
+                    sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
+                    span.set_outputs({"reranked_top_k": len(idx)})
+
+            # --- STEP 4: LLM GENERATION ---
+            answer, provider = await generate_answer(f"Analyst context:\n{combined}", req.query, complexity)
+
+            if root_span:
+                root_span.set_outputs({"final_answer": answer, "provider": provider})
+
+            # --- MLflow CHRONOLOGICAL METRICS LOGGING ---
+            if not TESTING and client and run_id:
+                try:
+                    ts_ms = int(time.time() * 1000)
+                    client.log_metric(run_id, "qdrant_ms", float(q_latency), ts_ms)
+                    client.log_metric(run_id, "rerank_ms", float(rerank_ms), ts_ms)
+                    client.log_metric(run_id, "total_e2e_ms", float((time.time() - req_arrival_time) * 1000), ts_ms)
+                except Exception as e: print("⚠️ MLflow log error:", e)
+
+            # --- PERSIST CACHE ---
             try:
-                if root_span:
-                    root_span.set_inputs({"user_query": req.query, "ticker": req.ticker})
+                db = SessionLocal()
+                db.add(CacheEntry(query_hash=q_hash, user_query=req.query, llm_response=answer, ticker=req.ticker, provider=provider))
+                db.commit(); db.close()
+            except: pass
 
-                with start_span(name="1_Query_Routing", span_type=SpanType.TOOL):
-                    complexity = route_query(req.query)
-
-                with start_span(name="2_Vector_Retrieval", span_type=SpanType.RETRIEVER):
-                    t_start = time.time()
-                    search = await asyncio.to_thread(
-                        retrieve_from_qdrant,
-                        batch_vectors[i],
-                        req.ticker,
-                        req.document_type,
-                    )
-                    q_latency = (time.time() - t_start) * 1000
-                    texts = [hit.payload.get("text", "") for hit in search.points if hit.payload]
-
-                if not texts:
-                    combined, sources = "No context found.", []
-                    rerank_ms = 0
-                else:
-                    with start_span(name="3_Reranking", span_type=SpanType.TOOL):
-                        t_rerank = time.time()
-                        idx, scores = await asyncio.to_thread(
-                            rerank_documents, req.query, texts, req.top_k
-                        )
-                        rerank_ms = (time.time() - t_rerank) * 1000
-                        combined = "\n\n".join([texts[j] for j in idx])
-                        sources = [{"score": float(scores[j]), "text": texts[j]} for j in idx]
-
-                answer, provider = await generate_answer(
-                    f"Analyst context:\n{combined}",
-                    req.query,
-                    complexity,
-                )
-
-                if root_span:
-                    root_span.set_outputs({"final_answer": answer})
-
-                if not TESTING:
-                    mlflow.log_metric("qdrant_ms", q_latency)
-                    mlflow.log_metric("rerank_ms", rerank_ms)
-                    mlflow.log_metric("total_e2e_ms", (time.time() - req_arrival_time) * 1000)
-
-                fut.set_result({
-                    "query_hash": q_hash,
-                    "query": req.query,
-                    "answer": answer,
-                    "sources": sources,
-                    "cached": False,
-                    "provider": provider,
-                })
-
-            except Exception as e:
-                fut.set_exception(e)
+            fut.set_result({"query_hash": q_hash, "query": req.query, "answer": answer, "sources": sources, "cached": False, "provider": provider})
+        
+        except Exception as e:
+            if root_span: root_span.set_attribute("error", str(e))
+            if not TESTING and client and run_id: client.set_terminated(run_id, status="FAILED")
+            fut.set_exception(e)
+        else:
+            if not TESTING and client and run_id: client.set_terminated(run_id, status="FINISHED")
 
 # ==========================================
 # BATCH ENGINE
