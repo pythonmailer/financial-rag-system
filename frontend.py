@@ -3,7 +3,6 @@ import requests
 import os
 import time
 import math
-import re
 
 # ==========================================
 # 1. CONFIGURATION & THEMING
@@ -15,7 +14,6 @@ st.set_page_config(
 )
 
 FIXED_TICKER = "AAPL"
-# Updated to point to your EC2 IP by default
 BACKEND_HOST = os.getenv("BACKEND_URL", "http://13.232.197.229:8001")
 ASK_URL = f"{BACKEND_HOST}/ask"
 HEALTH_URL = f"{BACKEND_HOST}/ready"
@@ -112,24 +110,18 @@ def normalize_score(raw_score):
     return max(0.0, min(1.0, norm_score))
 
 # ==========================================
-# 7. STREAM GENERATOR
+# 7. STREAM GENERATOR (SIMPLIFIED)
 # ==========================================
 def stream_tokens(text):
-    tokens = re.findall(r'\S+|\s+', text)
-    chunk = ""
-    for token in tokens:
-        chunk += token
-        if len(chunk) > 15:
-            yield chunk
-            time.sleep(0.01)
-            chunk = ""
-    if chunk:
-        yield chunk
+    words = text.split(" ")
+    for word in words:
+        yield word + " "
+        time.sleep(0.015)
 
 # ==========================================
 # 8. CHAT INPUT
 # ==========================================
-if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk factors..."):
+if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
 
     # Reset streaming state for new prompt
     st.session_state.streaming_done = False
@@ -143,46 +135,36 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-
         # ======================
         # RUN ONLY ONCE
         # ======================
         if not st.session_state.streaming_done:
 
+            response = None
             with st.spinner("Retrieving SEC Filings & Reranking Context..."):
                 try:
-                    payload = {
-                        "query": prompt,
-                        "ticker": FIXED_TICKER,
-                        "top_k": top_k
-                    }
-
+                    payload = {"query": prompt, "ticker": FIXED_TICKER, "top_k": top_k}
                     response = requests.post(ASK_URL, json=payload, timeout=60)
-
-                    if response.status_code == 200:
-                        data = response.json()
-
-                        answer = data.get("answer", "No analysis available.")
-                        sources = data.get("sources", [])
-                        provider = data.get("provider", "LLM")
-                        is_cached = data.get("cached", False)
-
-                        # Save for reruns
-                        st.session_state.last_answer = answer
-                        st.session_state.last_sources = sources
-                        st.session_state.last_provider = provider
-                        st.session_state.last_cached = is_cached
-
-                        # Stream text safely
-                        st.write_stream(stream_tokens(answer))
-                        st.session_state.streaming_done = True
-
-                    else:
-                        st.error(f"Analysis failed. Backend returned: {response.status_code}")
-
                 except Exception as e:
                     st.error(f"Connection Error: {e}")
+
+            # 🛑 EXECUTE OUTSIDE THE SPINNER TO PREVENT INFINITE LOOPING 🛑
+            if response and response.status_code == 200:
+                data = response.json()
+                answer = data.get("answer", "No analysis available.")
+                sources = data.get("sources", [])
+                
+                st.session_state.last_answer = answer
+                st.session_state.last_sources = sources
+                st.session_state.last_provider = data.get("provider", "LLM")
+                st.session_state.last_cached = data.get("cached", False)
+
+                # Stream text safely
+                st.write_stream(stream_tokens(answer))
+                st.session_state.streaming_done = True
+
+            elif response:
+                st.error(f"Analysis failed. Backend returned: {response.status_code}")
 
         else:
             # Rerun path → show final instantly
@@ -210,7 +192,6 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth, or risk fa
         with st.expander("📚 View Document Evidence"):
             for i, src in enumerate(st.session_state.last_sources):
                 score = normalize_score(src.get("score", 0.0))
-
                 st.markdown(f"**Chunk {i+1}** | Relevancy: `{score:.2%}`")
                 st.progress(score)
                 st.caption(src.get("text", "")[:400] + "...")
