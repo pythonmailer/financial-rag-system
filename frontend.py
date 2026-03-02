@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import os
-import time
 import math
 
 # ==========================================
@@ -94,27 +93,31 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # ==========================================
-# 6. PERFECT STREAM GENERATOR
+# 6. SAFE SCORE NORMALIZATION
 # ==========================================
-def stream_tokens(text):
-    """Yields text smoothly while perfectly preserving newlines and markdown formatting."""
-    lines = text.split('\n')
-    for i, line in enumerate(lines):
-        words = line.split(' ')
-        for word in words:
-            yield word + ' '
-            time.sleep(0.01) # Smooth typing speed
-        
-        # Add the newline character back at the end of the line
-        if i < len(lines) - 1:
-            yield '\n'
+def normalize_score(raw_score):
+    try:
+        raw_score = float(raw_score)
+    except:
+        raw_score = 0.0
+
+    if math.isnan(raw_score) or math.isinf(raw_score):
+        raw_score = 0.0
+
+    # Prevent math overflow by capping extreme values
+    raw_score = max(min(raw_score, 10), -10)
+    
+    # Sigmoid function: turns logits (like 5.24) into percentages (like 0.99)
+    norm_score = 1 / (1 + math.exp(-raw_score))
+    return max(0.0, min(1.0, norm_score))
+
 
 # ==========================================
 # 7. CHAT INPUT
 # ==========================================
 if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
 
-    # Reset streaming state for new prompt
+    # Reset state for new prompt
     st.session_state.streaming_done = False
     st.session_state.answer_saved = False
     st.session_state.last_answer = None
@@ -132,10 +135,10 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
         if not st.session_state.streaming_done:
 
             response = None
-            with st.spinner("Retrieving SEC Filings & Reranking Context..."):
+            with st.spinner("Retrieving SEC Filings & Generating Analysis..."):
                 try:
                     payload = {"query": prompt, "ticker": FIXED_TICKER, "top_k": top_k}
-                    response = requests.post(ASK_URL, json=payload, timeout=60)
+                    response = requests.post(ASK_URL, json=payload, timeout=90)
                 except Exception as e:
                     st.error(f"Connection Error: {e}")
 
@@ -158,8 +161,8 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
                 st.session_state.last_provider = provider
                 st.session_state.last_cached = is_cached
 
-                # Stream text safely using the newline-preserving generator
-                st.write_stream(stream_tokens(answer))
+                # 🚨 THE FIX: Display text instantly instead of streaming
+                st.markdown(answer)
                 st.session_state.streaming_done = True
 
             elif response is not None:
@@ -197,31 +200,4 @@ if prompt := st.chat_input("Ask about Apple's Q3 revenue, R&D growth..."):
                 except (ValueError, TypeError):
                     raw_score = 0.0
 
-                # 2. Hard Sigmoid clamping (Forces any number to become 0.0 -> 1.0)
-                if raw_score > 10.0:
-                    norm_score = 1.0
-                elif raw_score < -10.0:
-                    norm_score = 0.0
-                else:
-                    norm_score = 1.0 / (1.0 + math.exp(-raw_score))
-
-                # 3. Absolute final failsafe guard for Streamlit
-                safe_score = max(0.0, min(1.0, norm_score))
-
-                st.markdown(f"**Chunk {i+1}** | Relevancy: `{safe_score:.2%}`")
-                st.progress(safe_score) 
-                st.caption(src.get("text", "")[:400] + "...")
-                st.divider()
-
-    # ======================================
-    # SAVE ASSISTANT MESSAGE ONCE
-    # ======================================
-    if (
-        st.session_state.streaming_done
-        and not st.session_state.answer_saved
-        and st.session_state.last_answer
-    ):
-        st.session_state.messages.append(
-            {"role": "assistant", "content": st.session_state.last_answer}
-        )
-        st.session_state.answer_saved = True
+                # 2. Hard Sigmoid clamping (Forces any number
