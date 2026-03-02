@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 
 from fastapi import FastAPI, Depends
-from mlflow.tracing.span import SpanType
+from mlflow.entities import SpanType
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
