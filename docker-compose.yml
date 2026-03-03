@@ -59,7 +59,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 90s
     restart: unless-stopped
 
   backend:
@@ -84,7 +84,7 @@ services:
       postgres:
         condition: service_healthy
       mlflow:
-        condition: service_healthy
+        condition: service_started
       qdrant:
         condition: service_healthy
     healthcheck:
