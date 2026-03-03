@@ -37,6 +37,7 @@ services:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow
     environment:
+      # This is the primary fix for the 403 Forbidden error
       MLFLOW_HTTP_HOST_VALIDATION_DISABLED: "true"
       MLFLOW_SERVER_ALLOWED_HOSTS: "*"
       MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: "*"
@@ -46,7 +47,6 @@ services:
       --port 5001
       --backend-store-uri postgresql://admin:adminpassword@postgres:5432/mlflow_db
       --default-artifact-root /mlruns
-      --uvicorn-opts "--host-validation-disabled"
     ports:
       - "5001:5001"
     volumes:
@@ -55,10 +55,10 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:5001/health || exit 1"]
-      interval: 15s
+      test: ["CMD-SHELL", "timeout 5s bash -c ':> /dev/tcp/127.0.0.1/5001' || exit 1"]
+      interval: 20s
       timeout: 10s
-      retries: 5
+      retries: 3
       start_period: 90s
     restart: unless-stopped
 
@@ -84,7 +84,7 @@ services:
       postgres:
         condition: service_healthy
       mlflow:
-        condition: service_started
+        condition: service_healthy
       qdrant:
         condition: service_healthy
     healthcheck:
