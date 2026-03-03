@@ -41,7 +41,7 @@ services:
       MLFLOW_SERVER_ALLOWED_HOSTS: "*"
     command: >
       mlflow server
-      --backend-store-uri sqlite:////mlruns/mlflow.db
+      --backend-store-uri postgresql://admin:adminpassword@postgres:5432/mlflow_db
       --default-artifact-root /mlruns
       --host 0.0.0.0
       --port 5001
@@ -49,6 +49,9 @@ services:
       - "5001:5001"
     volumes:
       - mlflow_data:/mlruns
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/health')\""]
       interval: 10s
@@ -56,7 +59,6 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
-
 
   backend:
     build: .
@@ -72,7 +74,7 @@ services:
       DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
       QDRANT_URL: http://qdrant:6333
       MLFLOW_TRACKING_URI: http://mlflow:5001
-      MLFLOW_EXPERIMENT_NAME: "Financial_RAG"
+      MLFLOW_EXPERIMENT_NAME: "Financial-RAG"
       TESTING: "False"
       PYTHONPATH: /app
       USE_GPU: "false"
