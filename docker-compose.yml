@@ -37,7 +37,7 @@ services:
     image: ghcr.io/mlflow/mlflow:latest
     container_name: mlflow
     environment:
-      # This is the primary fix for the 403 Forbidden error
+      # This is the primary fix for the 403 Forbidden error on AWS
       MLFLOW_HTTP_HOST_VALIDATION_DISABLED: "true"
       MLFLOW_SERVER_ALLOWED_HOSTS: "*"
       MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: "*"
