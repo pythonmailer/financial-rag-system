@@ -39,33 +39,29 @@ services:
     environment:
       MLFLOW_HTTP_HOST_VALIDATION_DISABLED: "true"
       MLFLOW_SERVER_ALLOWED_HOSTS: "*"
-      MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: "*"
     command: >
       mlflow server
+      --backend-store-uri sqlite:////mlruns/mlflow.db
+      --default-artifact-root /mlruns
       --host 0.0.0.0
       --port 5001
-      --backend-store-uri postgresql://admin:adminpassword@postgres:5432/mlflow_db
-      --default-artifact-root /mlruns
-      --gunicorn-opts "--forwarded-allow-ips='*'"
     ports:
       - "5001:5001"
     volumes:
       - mlflow_data:/mlruns
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/health')\""]
-      interval: 30s
-      timeout: 10s
+      interval: 10s
+      timeout: 5s
       retries: 5
-      start_period: 120s
+      start_period: 30s
     restart: unless-stopped
+
 
   backend:
     build: .
     container_name: backend
-    command: uvicorn main2:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 120
+    command: sh -c "python database.py && uvicorn main2:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 120"
     ports:
       - "8001:8001"
     environment:
@@ -76,7 +72,7 @@ services:
       DATABASE_URL: postgresql://admin:adminpassword@postgres:5432/financial_rag
       QDRANT_URL: http://qdrant:6333
       MLFLOW_TRACKING_URI: http://mlflow:5001
-      MLFLOW_EXPERIMENT_NAME: "Apple_Financial_RAG"
+      MLFLOW_EXPERIMENT_NAME: "Financial_RAG"
       TESTING: "False"
       PYTHONPATH: /app
       USE_GPU: "false"
@@ -112,7 +108,7 @@ services:
   ingestor:
     build: .
     container_name: ingestor
-    command: python ingest.py
+    command: python scheduler.py
     volumes:
       - ./sec_data:/app/sec_data
     environment:
@@ -123,7 +119,7 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-    restart: "no"
+    restart: unless-stopped
 
 volumes:
   postgres_data:

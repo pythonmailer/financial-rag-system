@@ -83,7 +83,7 @@ jobs:
             # 4. Generate Production .env (Aligned with 13.232.197.229 logic)
             # Note: We use the Elastic IP to avoid DNS resolution delays on startup
             echo "📝 Updating .env file..."
-            printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nHF_TOKEN=%s\nDATABASE_URL=postgresql://admin:adminpassword@13.232.197.229:5432/financial_rag\nMLFLOW_TRACKING_URI=http://13.232.197.229:5001\nQDRANT_URL=http://13.232.197.229:6333\nTESTING=False\nUSE_GPU=False\n" \
+            printf "GROQ_API_KEY=%s\nGEMINI_API_KEY=%s\nOPENROUTER_API_KEY=%s\nHF_TOKEN=%s\nDATABASE_URL=postgresql://admin:adminpassword@postgres:5432/financial_rag\nMLFLOW_TRACKING_URI=http://mlflow:5001\nQDRANT_URL=http://qdrant:6333\nTESTING=False\nUSE_GPU=False\n" \
             "$GROQ_API_KEY" "$GEMINI_API_KEY" "$OPENROUTER_API_KEY" "$HF_TOKEN" > .env
 
             # 5. Refresh Containers
